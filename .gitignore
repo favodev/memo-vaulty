@@ -12,6 +12,8 @@ dist
 dist-ssr
 *.local
 
+ROADMAP MEMOVAULT.txt
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

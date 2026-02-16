@@ -1,14 +1,152 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[derive(Serialize)]
+struct SearchResultItem {
+    title: String,
+    path: String,
+    snippet: String,
+}
+
+#[tauri::command]
+fn search_stub(query: &str) -> Vec<SearchResultItem> {
+    let clean_query = query.trim();
+
+    if clean_query.is_empty() {
+        return Vec::new();
+    }
+
+    search_local_files(clean_query)
+}
+
+fn search_local_files(query: &str) -> Vec<SearchResultItem> {
+    const MAX_RESULTS: usize = 30;
+    const MAX_SCANNED_FILES: usize = 20000;
+    const MAX_DEPTH: usize = 8;
+
+    let query_tokens: Vec<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if query_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut stack: Vec<(PathBuf, usize)> = default_roots()
+        .into_iter()
+        .map(|path| (path, 0usize))
+        .collect();
+
+    while let Some((current_dir, depth)) = stack.pop() {
+        if results.len() >= MAX_RESULTS || scanned_files >= MAX_SCANNED_FILES {
+            break;
+        }
+
+        if depth > MAX_DEPTH || should_skip_dir(&current_dir) {
+            continue;
+        }
+
+        let read_dir = match fs::read_dir(&current_dir) {
+            Ok(dir) => dir,
+            Err(_) => continue,
+        };
+
+        for entry in read_dir.flatten() {
+            if results.len() >= MAX_RESULTS || scanned_files >= MAX_SCANNED_FILES {
+                break;
+            }
+
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => continue,
+            };
+
+            if file_type.is_dir() {
+                if !should_skip_dir(&path) {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+
+            if !file_type.is_file() {
+                continue;
+            }
+
+            scanned_files += 1;
+
+            let file_name = match path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            let lowered_name = file_name.to_lowercase();
+            let is_match = query_tokens.iter().all(|token| lowered_name.contains(token));
+
+            if !is_match {
+                continue;
+            }
+
+            results.push(SearchResultItem {
+                title: file_name.to_string(),
+                path: path.to_string_lossy().to_string(),
+                snippet: "Coincidencia por nombre de archivo (búsqueda local inicial).".to_string(),
+            });
+        }
+    }
+
+    results
+}
+
+fn default_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        let user_root = PathBuf::from(user_profile);
+
+        for folder in ["Documents", "Desktop", "Downloads"] {
+            let path = user_root.join(folder);
+            if path.exists() {
+                roots.push(path);
+            }
+        }
+
+        if roots.is_empty() {
+            roots.push(user_root);
+        }
+    }
+
+    if roots.is_empty() {
+        if let Ok(current) = std::env::current_dir() {
+            roots.push(current);
+        }
+    }
+
+    roots
+}
+
+fn should_skip_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("node_modules") | Some("target") | Some(".git")
+    )
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![greet, search_stub])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
