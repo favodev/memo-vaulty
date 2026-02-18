@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -21,6 +22,9 @@ struct IndexedFileItem {
     title: String,
     path: String,
     search_key: String,
+    size_bytes: u64,
+    modified_unix_secs: u64,
+    content_excerpt: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -83,7 +87,13 @@ fn start_indexing(
 ) -> Result<IndexStatus, String> {
     let resolved_roots = resolve_roots(roots);
     let exclusions = normalize_extensions(excluded_extensions);
-    let indexed_files = build_index_files(&resolved_roots, &exclusions);
+    let previous_items = state
+        .index
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.files.clone()));
+
+    let indexed_files = build_index_files(&resolved_roots, &exclusions, previous_items.as_deref());
 
     let snapshot = IndexSnapshot {
         files: indexed_files,
@@ -178,7 +188,7 @@ fn search_in_index(
         results.push(SearchResultItem {
             title: item.title.clone(),
             path: item.path.clone(),
-            snippet: "Coincidencia desde índice local (más rápido).".to_string(),
+            snippet: build_index_snippet(item),
         });
     }
 
@@ -286,9 +296,20 @@ fn search_local_files(
     results
 }
 
-fn build_index_files(roots: &[PathBuf], excluded_extensions: &[String]) -> Vec<IndexedFileItem> {
+fn build_index_files(
+    roots: &[PathBuf],
+    excluded_extensions: &[String],
+    previous_items: Option<&[IndexedFileItem]>,
+) -> Vec<IndexedFileItem> {
     const MAX_INDEXED_FILES: usize = 400_000;
     const MAX_DEPTH: usize = 14;
+
+    let previous_lookup = previous_items
+        .unwrap_or(&[])
+        .iter()
+        .cloned()
+        .map(|item| (item.path.clone(), item))
+        .collect::<HashMap<String, IndexedFileItem>>();
 
     let mut indexed = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = roots
@@ -337,15 +358,89 @@ fn build_index_files(roots: &[PathBuf], excluded_extensions: &[String]) -> Vec<I
                 continue;
             };
 
+            let metadata = match entry.metadata() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let size_bytes = metadata.len();
+            let modified_unix_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_secs())
+                .unwrap_or_default();
+
+            let full_path = path.to_string_lossy().to_string();
+
+            if let Some(previous) = previous_lookup.get(&full_path) {
+                if previous.size_bytes == size_bytes
+                    && previous.modified_unix_secs == modified_unix_secs
+                {
+                    indexed.push(previous.clone());
+                    continue;
+                }
+            }
+
+            let content_excerpt = extract_indexable_text(&path);
+            let mut search_key = file_name.to_lowercase();
+
+            if let Some(content) = &content_excerpt {
+                search_key.push(' ');
+                search_key.push_str(&content.to_lowercase());
+            }
+
             indexed.push(IndexedFileItem {
                 title: file_name.to_string(),
-                path: path.to_string_lossy().to_string(),
-                search_key: file_name.to_lowercase(),
+                path: full_path,
+                search_key,
+                size_bytes,
+                modified_unix_secs,
+                content_excerpt,
             });
         }
     }
 
     indexed
+}
+
+fn extract_indexable_text(path: &Path) -> Option<String> {
+    const MAX_READ_BYTES: usize = 32 * 1024;
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())?;
+
+    if extension != "txt" && extension != "md" {
+        return None;
+    }
+
+    let bytes = fs::read(path).ok()?;
+    let slice = &bytes[..bytes.len().min(MAX_READ_BYTES)];
+    let content = String::from_utf8_lossy(slice);
+    let normalized = normalize_text_for_index(&content);
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn normalize_text_for_index(content: &str) -> String {
+    const MAX_CHARS: usize = 800;
+
+    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(MAX_CHARS).collect()
+}
+
+fn build_index_snippet(item: &IndexedFileItem) -> String {
+    if let Some(content) = &item.content_excerpt {
+        return format!("Coincidencia en nombre/contenido indexado: {}", content);
+    }
+
+    "Coincidencia por nombre desde índice local (más rápido).".to_string()
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {

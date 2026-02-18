@@ -161,7 +161,7 @@ function App() {
           <div className="mb-4 rounded-xl bg-white/4 p-4">
             <p className="text-sm font-medium text-white">Primera ejecución: crea tu índice local</p>
             <p className="mt-1 text-xs text-gray-400">
-              Indexa una vez y las búsquedas por nombre serán mucho más rápidas.
+              Indexa una vez y las búsquedas por nombre/contenido (TXT/MD) serán mucho más rápidas.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <button
@@ -202,6 +202,9 @@ function App() {
           <div className="mb-4 rounded-xl bg-white/4 p-3">
             <p className="text-xs text-gray-300">
               Índice activo: <span className="text-white">{indexStatus.indexed_files}</span> archivos
+            </p>
+            <p className="mt-1 text-[11px] text-gray-500">
+              Incluye nombre de archivo y contenido para TXT/MD (extracto inicial).
             </p>
             <div className="mt-2 flex flex-wrap gap-2">
               <button
