@@ -2,12 +2,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 use tauri::{Manager, State};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[tauri::command]
+fn open_file(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("No se pudo abrir el archivo: {err}"))?;
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Abrir archivo solo está implementado para Windows en esta fase".to_string())
+    }
 }
 
 #[derive(Serialize)]
@@ -84,16 +104,26 @@ fn start_indexing(
     state: State<'_, AppState>,
     roots: Option<Vec<String>>,
     excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
 ) -> Result<IndexStatus, String> {
     let resolved_roots = resolve_roots(roots);
     let exclusions = normalize_extensions(excluded_extensions);
+    let folder_exclusions = normalize_folder_rules(excluded_folders);
+    let max_file_size_bytes = max_size_bytes(max_file_size_mb);
     let previous_items = state
         .index
         .lock()
         .ok()
         .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.files.clone()));
 
-    let indexed_files = build_index_files(&resolved_roots, &exclusions, previous_items.as_deref());
+    let indexed_files = build_index_files(
+        &resolved_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+        previous_items.as_deref(),
+    );
 
     let snapshot = IndexSnapshot {
         files: indexed_files,
@@ -128,6 +158,8 @@ fn search_stub(
     query: &str,
     roots: Option<Vec<String>>,
     excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
 ) -> Vec<SearchResultItem> {
     let clean_query = query.trim();
 
@@ -137,12 +169,27 @@ fn search_stub(
 
     let search_roots = resolve_roots(roots);
     let exclusions = normalize_extensions(excluded_extensions);
+    let folder_exclusions = normalize_folder_rules(excluded_folders);
+    let max_file_size_bytes = max_size_bytes(max_file_size_mb);
 
-    if let Some(index_results) = search_in_index(state, clean_query, &search_roots, &exclusions) {
+    if let Some(index_results) = search_in_index(
+        state,
+        clean_query,
+        &search_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+    ) {
         return index_results;
     }
 
-    search_local_files(clean_query, &search_roots, &exclusions)
+    search_local_files(
+        clean_query,
+        &search_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+    )
 }
 
 fn search_in_index(
@@ -150,6 +197,8 @@ fn search_in_index(
     query: &str,
     roots: &[PathBuf],
     excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
 ) -> Option<Vec<SearchResultItem>> {
     const MAX_RESULTS: usize = 30;
 
@@ -173,7 +222,15 @@ fn search_in_index(
             continue;
         }
 
+        if should_skip_custom_dir(&path, excluded_folders) {
+            continue;
+        }
+
         if is_excluded_file(&path, excluded_extensions) {
+            continue;
+        }
+
+        if item.size_bytes > max_file_size_bytes {
             continue;
         }
 
@@ -188,7 +245,7 @@ fn search_in_index(
         results.push(SearchResultItem {
             title: item.title.clone(),
             path: item.path.clone(),
-            snippet: build_index_snippet(item),
+            snippet: build_index_snippet(item, &query_tokens),
         });
     }
 
@@ -199,6 +256,8 @@ fn search_local_files(
     query: &str,
     roots: &[PathBuf],
     excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
 ) -> Vec<SearchResultItem> {
     const MAX_RESULTS: usize = 30;
     const MAX_DEPTH: usize = 8;
@@ -229,7 +288,7 @@ fn search_local_files(
             break;
         }
 
-        if depth > MAX_DEPTH || should_skip_dir(&current_dir) {
+        if depth > MAX_DEPTH || should_skip_dir(&current_dir) || should_skip_custom_dir(&current_dir, excluded_folders) {
             continue;
         }
 
@@ -252,7 +311,7 @@ fn search_local_files(
             };
 
             if file_type.is_dir() {
-                if !should_skip_dir(&path) {
+                if !should_skip_dir(&path) && !should_skip_custom_dir(&path, excluded_folders) {
                     subdirs.push(path);
                 }
                 continue;
@@ -263,6 +322,16 @@ fn search_local_files(
             }
 
             if is_excluded_file(&path, excluded_extensions) {
+                continue;
+            }
+
+            let file_size = entry
+                .metadata()
+                .ok()
+                .map(|value| value.len())
+                .unwrap_or_default();
+
+            if file_size > max_file_size_bytes {
                 continue;
             }
 
@@ -299,6 +368,8 @@ fn search_local_files(
 fn build_index_files(
     roots: &[PathBuf],
     excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
     previous_items: Option<&[IndexedFileItem]>,
 ) -> Vec<IndexedFileItem> {
     const MAX_INDEXED_FILES: usize = 400_000;
@@ -323,7 +394,7 @@ fn build_index_files(
             break;
         }
 
-        if depth > MAX_DEPTH || should_skip_dir(&current_dir) {
+        if depth > MAX_DEPTH || should_skip_dir(&current_dir) || should_skip_custom_dir(&current_dir, excluded_folders) {
             continue;
         }
 
@@ -344,7 +415,7 @@ fn build_index_files(
             };
 
             if file_type.is_dir() {
-                if !should_skip_dir(&path) {
+                if !should_skip_dir(&path) && !should_skip_custom_dir(&path, excluded_folders) {
                     stack.push((path, depth + 1));
                 }
                 continue;
@@ -364,6 +435,11 @@ fn build_index_files(
             };
 
             let size_bytes = metadata.len();
+
+            if size_bytes > max_file_size_bytes {
+                continue;
+            }
+
             let modified_unix_secs = metadata
                 .modified()
                 .ok()
@@ -376,6 +452,7 @@ fn build_index_files(
             if let Some(previous) = previous_lookup.get(&full_path) {
                 if previous.size_bytes == size_bytes
                     && previous.modified_unix_secs == modified_unix_secs
+                    && !needs_content_refresh(&path, previous)
                 {
                     indexed.push(previous.clone());
                     continue;
@@ -404,6 +481,20 @@ fn build_index_files(
     indexed
 }
 
+fn needs_content_refresh(path: &Path, previous: &IndexedFileItem) -> bool {
+    if previous.content_excerpt.is_some() {
+        return false;
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+
+    matches!(extension.as_str(), "txt" | "md" | "pdf")
+}
+
 fn extract_indexable_text(path: &Path) -> Option<String> {
     const MAX_READ_BYTES: usize = 32 * 1024;
 
@@ -412,6 +503,16 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
         .and_then(|value| value.to_str())
         .map(|value| value.to_lowercase())?;
 
+    if extension == "pdf" {
+        let text = extract_pdf_text(path)?;
+        let normalized = normalize_text_for_index(&text, 120_000);
+        return if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        };
+    }
+
     if extension != "txt" && extension != "md" {
         return None;
     }
@@ -419,7 +520,7 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     let slice = &bytes[..bytes.len().min(MAX_READ_BYTES)];
     let content = String::from_utf8_lossy(slice);
-    let normalized = normalize_text_for_index(&content);
+    let normalized = normalize_text_for_index(&content, 12_000);
 
     if normalized.is_empty() {
         None
@@ -428,15 +529,46 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
     }
 }
 
-fn normalize_text_for_index(content: &str) -> String {
-    const MAX_CHARS: usize = 800;
+fn extract_pdf_text(path: &Path) -> Option<String> {
+    let extracted = std::panic::catch_unwind(|| pdf_extract::extract_text(path))
+        .ok()?
+        .ok()?;
 
-    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    compact.chars().take(MAX_CHARS).collect()
+    if extracted.trim().is_empty() {
+        None
+    } else {
+        Some(extracted)
+    }
 }
 
-fn build_index_snippet(item: &IndexedFileItem) -> String {
+fn normalize_text_for_index(content: &str, max_chars: usize) -> String {
+    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(max_chars).collect()
+}
+
+fn build_index_snippet(item: &IndexedFileItem, query_tokens: &[String]) -> String {
     if let Some(content) = &item.content_excerpt {
+        let lowered = content.to_lowercase();
+        let first_match = query_tokens
+            .iter()
+            .filter_map(|token| lowered.find(token))
+            .min();
+
+        if let Some(match_pos) = first_match {
+            let start_char = lowered[..match_pos].chars().count().saturating_sub(40);
+            let total_chars = content.chars().count();
+            let take_chars = 170usize;
+            let end_char = (start_char + take_chars).min(total_chars);
+
+            let excerpt = content
+                .chars()
+                .skip(start_char)
+                .take(end_char.saturating_sub(start_char))
+                .collect::<String>();
+
+            return format!("Coincidencia en nombre/contenido indexado: {}", excerpt);
+        }
+
         return format!("Coincidencia en nombre/contenido indexado: {}", content);
     }
 
@@ -509,6 +641,33 @@ fn normalize_extensions(excluded_extensions: Option<Vec<String>>) -> Vec<String>
         .map(|ext| ext.trim().trim_start_matches('.').to_lowercase())
         .filter(|ext| !ext.is_empty())
         .collect()
+}
+
+fn normalize_folder_rules(excluded_folders: Option<Vec<String>>) -> Vec<String> {
+    excluded_folders
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| name.trim().to_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn should_skip_custom_dir(path: &Path, excluded_folders: &[String]) -> bool {
+    if excluded_folders.is_empty() {
+        return false;
+    }
+
+    let lowered_path = path.to_string_lossy().to_lowercase();
+    excluded_folders
+        .iter()
+        .any(|rule| lowered_path.contains(&format!("\\{}\\", rule)) || lowered_path.ends_with(&format!("\\{}", rule)))
+}
+
+fn max_size_bytes(max_file_size_mb: Option<u64>) -> u64 {
+    const DEFAULT_MB: u64 = 128;
+
+    let mb = max_file_size_mb.unwrap_or(DEFAULT_MB).max(1);
+    mb.saturating_mul(1024 * 1024)
 }
 
 fn is_excluded_file(path: &Path, excluded_extensions: &[String]) -> bool {
@@ -610,6 +769,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             greet,
+            open_file,
             search_stub,
             start_indexing,
             get_index_status

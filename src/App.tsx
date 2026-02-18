@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 type SearchResultItem = {
@@ -17,6 +17,11 @@ type IndexStatus = {
   roots: string[];
 };
 
+type IndexFeedback = {
+  type: "running" | "success" | "error";
+  text: string;
+};
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -26,10 +31,12 @@ function App() {
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [searchRoots, setSearchRoots] = useState<string[]>([]);
   const [excludedExtensions, setExcludedExtensions] = useState("mkv, mp4, zip");
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [excludedFolders, setExcludedFolders] = useState("node_modules, .git, target, AppData");
+  const [maxFileSizeMb, setMaxFileSizeMb] = useState("128");
+  const [isConfigOpen, setIsConfigOpen] = useState(false);
   const [isIndexing, setIsIndexing] = useState(false);
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
-  const [indexMessage, setIndexMessage] = useState<string | null>(null);
+  const [indexFeedback, setIndexFeedback] = useState<IndexFeedback | null>(null);
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -44,8 +51,28 @@ function App() {
     void loadStatus();
   }, []);
 
+  useEffect(() => {
+    if (!indexFeedback) {
+      return;
+    }
+
+    if (indexFeedback.type === "running") {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      setIndexFeedback(null);
+    }, 2600);
+
+    return () => clearTimeout(timeout);
+  }, [indexFeedback]);
+
   const openFile = async (filePath: string) => {
-    await openPath(filePath);
+    try {
+      await invoke("open_file", { path: filePath });
+    } catch {
+      setErrorMessage("No se pudo abrir el archivo.");
+    }
   };
 
   const openContainingFolder = async (filePath: string) => {
@@ -73,10 +100,20 @@ function App() {
         .map((value) => value.trim())
         .filter((value) => value.length > 0);
 
+      const excludedFolderRules = excludedFolders
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
+      const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+
       const response = await invoke<SearchResultItem[]>("search_stub", {
         query: cleanQuery,
         roots: searchRoots,
         excludedExtensions: exclusions,
+        excludedFolders: excludedFolderRules,
+        maxFileSizeMb: maxSizeValue,
       });
       setResults(response);
       setSelectedIndex(response.length > 0 ? 0 : -1);
@@ -112,8 +149,9 @@ function App() {
   };
 
   const startIndexing = async (roots?: string[]) => {
+    const startedAt = Date.now();
     setIsIndexing(true);
-    setIndexMessage("Indexando archivos locales... esto puede tardar varios minutos.");
+    setIndexFeedback({ type: "running", text: "Indexando..." });
 
     try {
       const exclusions = excludedExtensions
@@ -121,47 +159,114 @@ function App() {
         .map((value) => value.trim())
         .filter((value) => value.length > 0);
 
+      const excludedFolderRules = excludedFolders
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
+      const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+
       const status = await invoke<IndexStatus>("start_indexing", {
         roots,
         excludedExtensions: exclusions,
+        excludedFolders: excludedFolderRules,
+        maxFileSizeMb: maxSizeValue,
       });
 
       setIndexStatus(status);
       if (status.roots.length > 0) {
         setSearchRoots(status.roots);
       }
-      setIndexMessage(`Índice listo: ${status.indexed_files} archivos.`);
+      setIndexFeedback({ type: "success", text: "Reindexación hecha" });
     } catch {
-      setIndexMessage("Falló la indexación local. Intenta con una carpeta más pequeña primero.");
+      setErrorMessage("Falló la indexación local. Intenta con una carpeta más pequeña primero.");
+      setIndexFeedback({ type: "error", text: "Reindexación falló" });
     } finally {
+      const elapsed = Date.now() - startedAt;
+      const minVisibleMs = 900;
+      if (elapsed < minVisibleMs) {
+        await new Promise((resolve) => setTimeout(resolve, minVisibleMs - elapsed));
+      }
       setIsIndexing(false);
     }
   };
 
-  const shouldAnchorTop =
-    showAdvanced ||
-    isLoading ||
-    Boolean(errorMessage) ||
-    hasSearched ||
-    results.length > 0;
+  const formatIndexedAt = (value: string | null) => {
+    if (!value) {
+      return null;
+    }
+
+    const unixSecs = Number.parseInt(value, 10);
+    if (!Number.isFinite(unixSecs)) {
+      return null;
+    }
+
+    return new Date(unixSecs * 1000).toLocaleString();
+  };
+
+  const queryTokens = useMemo(() => {
+    return query
+      .toLowerCase()
+      .split(/[^a-z0-9áéíóúñü]+/i)
+      .filter((token) => token.length > 0);
+  }, [query]);
+
+  const renderHighlighted = (text: string) => {
+    if (!text || queryTokens.length === 0) {
+      return text;
+    }
+
+    const escaped = queryTokens.map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const pattern = new RegExp(`(${escaped.join("|")})`, "gi");
+    const parts = text.split(pattern);
+
+    return parts.map((part, index) => {
+      const isMatch = queryTokens.some((token) => token === part.toLowerCase());
+      if (isMatch) {
+        return (
+          <mark key={`m-${index}`} className="rounded-sm bg-emerald-400/30 px-0.5 text-emerald-100">
+            {part}
+          </mark>
+        );
+      }
+
+      return <Fragment key={`t-${index}`}>{part}</Fragment>;
+    });
+  };
+
+  const visibleRoots = (indexStatus?.roots.length ? indexStatus.roots : searchRoots).slice(0, 4);
+  const hasMoreRoots = (indexStatus?.roots.length ? indexStatus.roots.length : searchRoots.length) > visibleRoots.length;
 
   return (
     <div
-      className={`min-h-screen w-full bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-gray-900 via-black to-black flex flex-col items-center p-4 ${
-        shouldAnchorTop ? "justify-start" : "justify-center"
-      }`}
+      className="min-h-screen w-full bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-[#0a0b0f] via-[#020203] to-[#010101] flex flex-col items-center justify-start px-5 pb-5 pt-8"
     >
       <motion.div
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.5, ease: "easeOut" }}
-        className="vault-scroll w-full max-w-lg z-10 max-h-[calc(100vh-2rem)] overflow-y-auto pb-4"
+        className="vault-scroll relative w-full max-w-5xl z-10 max-h-[calc(100vh-2rem)] overflow-y-auto pb-4"
       >
+        <div className="mb-3 flex items-center justify-end">
+          <button
+            type="button"
+            className="rounded-lg bg-white/10 p-2 text-gray-200 transition-colors hover:bg-white/20"
+            title="Configuración"
+            aria-label="Abrir configuración"
+            onClick={() => setIsConfigOpen(true)}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0-1 .6 1.65 1.65 0 0 0-.33 1V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-.33-1A1.65 1.65 0 0 0 8 19.4a1.65 1.65 0 0 0-1-.6 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-.6-1 1.65 1.65 0 0 0-1-.33H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1-.33A1.65 1.65 0 0 0 4.6 8a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 8 4.6a1.65 1.65 0 0 0 1-.6 1.65 1.65 0 0 0 .33-1V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 .33 1A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1 .6 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 8a1.65 1.65 0 0 0 .6 1 1.65 1.65 0 0 0 1 .33H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1 .33 1.65 1.65 0 0 0-.51 1.34Z"/></svg>
+          </button>
+        </div>
+
+        <div className={`transition-opacity duration-200 ${isConfigOpen ? "opacity-35" : "opacity-100"}`}>
+
         {!indexStatus?.has_index && (
-          <div className="mb-4 rounded-xl bg-white/4 p-4">
+          <div className="mb-4 rounded-xl bg-white/4 p-4 ring-1 ring-white/10">
             <p className="text-sm font-medium text-white">Primera ejecución: crea tu índice local</p>
             <p className="mt-1 text-xs text-gray-400">
-              Indexa una vez y las búsquedas por nombre/contenido (TXT/MD) serán mucho más rápidas.
+              Indexa una vez y las búsquedas por nombre/contenido (PDF, MD, TXT) serán mucho más rápidas.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <button
@@ -179,33 +284,36 @@ function App() {
                 className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
                 disabled={isIndexing}
                 onClick={() => {
-                  void pickFolders();
+                  setIsConfigOpen(true);
                 }}
               >
-                Elegir carpetas
-              </button>
-              <button
-                type="button"
-                className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                disabled={isIndexing || searchRoots.length === 0}
-                onClick={() => {
-                  void startIndexing(searchRoots);
-                }}
-              >
-                Indexar selección
+                Abrir configuración
               </button>
             </div>
           </div>
         )}
 
         {indexStatus?.has_index && (
-          <div className="mb-4 rounded-xl bg-white/4 p-3">
+          <div className="mb-4 rounded-xl bg-white/4 p-4 ring-1 ring-white/10">
             <p className="text-xs text-gray-300">
-              Índice activo: <span className="text-white">{indexStatus.indexed_files}</span> archivos
+              Índice activo: <span className="text-white">{indexStatus.indexed_files}</span> archivos en <span className="text-white">{indexStatus.roots.length}</span> carpetas
             </p>
             <p className="mt-1 text-[11px] text-gray-500">
-              Incluye nombre de archivo y contenido para TXT/MD (extracto inicial).
+              Archivos que se indexan por contenido: PDF, MD y TXT.
             </p>
+            {visibleRoots.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {visibleRoots.map((root) => (
+                  <span key={root} className="inline-flex max-w-full items-center gap-1 truncate rounded-md bg-emerald-500/15 px-2 py-1 text-[11px] text-emerald-300 ring-1 ring-emerald-400/30">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4.3a2 2 0 0 1 1.4.58l1.22 1.22a2 2 0 0 0 1.41.58H18.5A2.5 2.5 0 0 1 21 10v8.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 18.5Z"/></svg>
+                    <span className="truncate">{root}</span>
+                  </span>
+                ))}
+                {hasMoreRoots && (
+                  <span className="rounded-md bg-emerald-500/15 px-2 py-1 text-[11px] text-emerald-300 ring-1 ring-emerald-400/30">+{(indexStatus?.roots.length ?? 0) - visibleRoots.length} más</span>
+                )}
+              </div>
+            )}
             <div className="mt-2 flex flex-wrap gap-2">
               <button
                 type="button"
@@ -217,15 +325,31 @@ function App() {
               >
                 {isIndexing ? "Reindexando..." : "Reindexar"}
               </button>
+
+              {indexFeedback && (
+                <span
+                  className={`inline-flex items-center rounded-md px-2.5 py-1 text-[11px] ${
+                    indexFeedback.type === "running"
+                      ? "bg-blue-500/20 text-blue-300 ring-1 ring-blue-400/30"
+                      : indexFeedback.type === "success"
+                      ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30"
+                      : "bg-red-500/20 text-red-300 ring-1 ring-red-400/30"
+                  }`}
+                >
+                  {indexFeedback.text}
+                </span>
+              )}
             </div>
+
+            {formatIndexedAt(indexStatus.indexed_at) && (
+              <p className="mt-1 text-[11px] text-gray-500">
+                Última indexación: {formatIndexedAt(indexStatus.indexed_at)}
+              </p>
+            )}
           </div>
         )}
 
-        {indexMessage && (
-          <p className="mb-3 text-xs text-center text-gray-400">{indexMessage}</p>
-        )}
-
-        <div className="group flex items-center gap-3 rounded-xl bg-white/5 px-4 transition-all duration-300 focus-within:bg-white/10">
+        <div className="group flex items-center gap-3 rounded-xl bg-white/5 px-4 transition-all duration-300 focus-within:bg-white/10 ring-1 ring-white/10">
           <div className="text-gray-500 group-focus-within:text-blue-400 transition-colors pointer-events-none shrink-0">
             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-search"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
           </div>
@@ -274,74 +398,6 @@ function App() {
           />
         </div>
 
-        <motion.p
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ delay: 0.3 }}
-          className="mt-4 text-gray-500 text-sm text-center"
-        >
-          Presiona <kbd className="bg-white/10 px-1.5 py-0.5 rounded text-xs">Enter</kbd> para buscar.
-        </motion.p>
-
-        <div className="mt-4 flex items-center justify-center">
-          <button
-            type="button"
-            className="text-xs text-gray-500 transition-colors hover:text-gray-300"
-            onClick={() => setShowAdvanced((prev) => !prev)}
-          >
-            {showAdvanced ? "Ocultar opciones avanzadas" : "Mostrar opciones avanzadas"}
-          </button>
-        </div>
-
-        {showAdvanced && (
-          <div className="mt-3 space-y-3 rounded-lg bg-white/3 p-3">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-xs uppercase tracking-wide text-gray-500">Fuentes de búsqueda</p>
-              <button
-                type="button"
-                className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
-                onClick={() => {
-                  void pickFolders();
-                }}
-              >
-                Añadir carpeta
-              </button>
-            </div>
-
-            {searchRoots.length > 0 ? (
-              <div className="flex flex-wrap gap-2">
-                {searchRoots.map((root) => (
-                  <button
-                    key={root}
-                    type="button"
-                    className="max-w-full truncate rounded-md bg-white/10 px-2 py-1 text-[11px] text-gray-300 hover:bg-white/15"
-                    title="Quitar carpeta"
-                    onClick={() => removeRoot(root)}
-                  >
-                    {root}
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <p className="text-xs text-gray-500">Sin carpetas seleccionadas: se usan Documents/Desktop/Downloads.</p>
-            )}
-
-            <div className="space-y-1">
-              <label className="text-[11px] text-gray-500" htmlFor="excluded-exts">
-                Excluir extensiones (coma separada)
-              </label>
-              <input
-                id="excluded-exts"
-                type="text"
-                className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                placeholder="mkv, mp4, zip"
-                value={excludedExtensions}
-                onChange={(e) => setExcludedExtensions(e.target.value)}
-              />
-            </div>
-          </div>
-        )}
-
         {isLoading && (
           <p className="mt-4 text-sm text-center text-gray-400">Buscando en tu bóveda...</p>
         )}
@@ -355,7 +411,7 @@ function App() {
         )}
 
         {!isLoading && results.length > 0 && (
-          <div className="mt-5 max-h-[56vh] space-y-2 overflow-y-auto pr-1 pb-2">
+          <div className="mt-5 max-h-[62vh] space-y-2 overflow-y-auto pr-1 pb-2">
             {results.map((item, index) => (
               <div
                 key={item.path}
@@ -367,8 +423,8 @@ function App() {
                   void openFile(item.path);
                 }}
               >
-                <p className="text-sm font-medium text-white">{item.title}</p>
-                <p className="mt-1 text-xs text-gray-400">{item.snippet}</p>
+                <p className="text-sm font-medium text-white">{renderHighlighted(item.title)}</p>
+                <p className="mt-1 text-xs text-gray-400">{renderHighlighted(item.snippet)}</p>
                 <p className="mt-1 text-[11px] text-gray-500 truncate">{item.path}</p>
                 <div className="mt-2 flex items-center gap-2">
                   <button
@@ -392,6 +448,131 @@ function App() {
                 </div>
               </div>
             ))}
+          </div>
+        )}
+
+        </div>
+
+        {isConfigOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4"
+            onClick={() => setIsConfigOpen(false)}
+          >
+            <div
+              className="w-full max-w-2xl rounded-xl bg-[#07090d] p-4 shadow-xl ring-1 ring-white/10"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-medium text-white">Configuración de indexación</h2>
+                <button
+                  type="button"
+                  className="rounded-md bg-white/10 px-2 py-1 text-xs text-gray-200 hover:bg-white/20"
+                  onClick={() => setIsConfigOpen(false)}
+                >
+                  Cerrar
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-4">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-xs uppercase tracking-wide text-gray-500">Carpetas a indexar</p>
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
+                      onClick={() => {
+                        void pickFolders();
+                      }}
+                    >
+                      Añadir carpeta
+                    </button>
+                  </div>
+
+                  {searchRoots.length > 0 ? (
+                    <div className="flex flex-wrap gap-2">
+                      {searchRoots.map((root) => (
+                        <button
+                          key={root}
+                          type="button"
+                          className="max-w-full truncate rounded-md bg-white/10 px-2 py-1 text-[11px] text-gray-300 hover:bg-white/15"
+                          title="Quitar carpeta"
+                          onClick={() => removeRoot(root)}
+                        >
+                          {root}
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-gray-500">Sin carpetas seleccionadas: por defecto se usan Documents/Desktop/Downloads.</p>
+                  )}
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[11px] text-gray-500" htmlFor="excluded-exts">
+                    Excluir extensiones (coma separada)
+                  </label>
+                  <input
+                    id="excluded-exts"
+                    type="text"
+                    className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                    placeholder="mkv, mp4, zip"
+                    value={excludedExtensions}
+                    onChange={(e) => setExcludedExtensions(e.target.value)}
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[11px] text-gray-500" htmlFor="excluded-folders">
+                    Excluir carpetas por nombre (coma separada)
+                  </label>
+                  <input
+                    id="excluded-folders"
+                    type="text"
+                    className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                    placeholder="node_modules, .git, target"
+                    value={excludedFolders}
+                    onChange={(e) => setExcludedFolders(e.target.value)}
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[11px] text-gray-500" htmlFor="max-size-mb">
+                    Tamaño máximo por archivo (MB)
+                  </label>
+                  <input
+                    id="max-size-mb"
+                    type="number"
+                    min={1}
+                    className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                    value={maxFileSizeMb}
+                    onChange={(e) => setMaxFileSizeMb(e.target.value)}
+                  />
+                </div>
+
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    type="button"
+                    className="rounded-md bg-blue-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-blue-500"
+                    disabled={isIndexing}
+                    onClick={() => {
+                      void startIndexing(["C:\\"]);
+                    }}
+                  >
+                    {isIndexing ? "Indexando..." : "Indexar todo C:"}
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                    disabled={isIndexing || searchRoots.length === 0}
+                    onClick={() => {
+                      void startIndexing(searchRoots);
+                    }}
+                  >
+                    Indexar selección
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         )}
       </motion.div>
