@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -8,6 +8,13 @@ type SearchResultItem = {
   title: string;
   path: string;
   snippet: string;
+};
+
+type IndexStatus = {
+  has_index: boolean;
+  indexed_files: number;
+  indexed_at: string | null;
+  roots: string[];
 };
 
 function App() {
@@ -20,6 +27,22 @@ function App() {
   const [searchRoots, setSearchRoots] = useState<string[]>([]);
   const [excludedExtensions, setExcludedExtensions] = useState("mkv, mp4, zip");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [isIndexing, setIsIndexing] = useState(false);
+  const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
+  const [indexMessage, setIndexMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    const loadStatus = async () => {
+      try {
+        const status = await invoke<IndexStatus>("get_index_status");
+        setIndexStatus(status);
+      } catch {
+        setIndexStatus(null);
+      }
+    };
+
+    void loadStatus();
+  }, []);
 
   const openFile = async (filePath: string) => {
     await openPath(filePath);
@@ -88,6 +111,33 @@ function App() {
     setSearchRoots((prev) => prev.filter((path) => path !== pathToRemove));
   };
 
+  const startIndexing = async (roots?: string[]) => {
+    setIsIndexing(true);
+    setIndexMessage("Indexando archivos locales... esto puede tardar varios minutos.");
+
+    try {
+      const exclusions = excludedExtensions
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const status = await invoke<IndexStatus>("start_indexing", {
+        roots,
+        excludedExtensions: exclusions,
+      });
+
+      setIndexStatus(status);
+      if (status.roots.length > 0) {
+        setSearchRoots(status.roots);
+      }
+      setIndexMessage(`Índice listo: ${status.indexed_files} archivos.`);
+    } catch {
+      setIndexMessage("Falló la indexación local. Intenta con una carpeta más pequeña primero.");
+    } finally {
+      setIsIndexing(false);
+    }
+  };
+
   const shouldAnchorTop =
     showAdvanced ||
     isLoading ||
@@ -107,6 +157,71 @@ function App() {
         transition={{ duration: 0.5, ease: "easeOut" }}
         className="vault-scroll w-full max-w-lg z-10 max-h-[calc(100vh-2rem)] overflow-y-auto pb-4"
       >
+        {!indexStatus?.has_index && (
+          <div className="mb-4 rounded-xl bg-white/4 p-4">
+            <p className="text-sm font-medium text-white">Primera ejecución: crea tu índice local</p>
+            <p className="mt-1 text-xs text-gray-400">
+              Indexa una vez y las búsquedas por nombre serán mucho más rápidas.
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="rounded-md bg-blue-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-blue-500"
+                disabled={isIndexing}
+                onClick={() => {
+                  void startIndexing(["C:\\"]);
+                }}
+              >
+                {isIndexing ? "Indexando..." : "Indexar todo C:"}
+              </button>
+              <button
+                type="button"
+                className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                disabled={isIndexing}
+                onClick={() => {
+                  void pickFolders();
+                }}
+              >
+                Elegir carpetas
+              </button>
+              <button
+                type="button"
+                className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                disabled={isIndexing || searchRoots.length === 0}
+                onClick={() => {
+                  void startIndexing(searchRoots);
+                }}
+              >
+                Indexar selección
+              </button>
+            </div>
+          </div>
+        )}
+
+        {indexStatus?.has_index && (
+          <div className="mb-4 rounded-xl bg-white/4 p-3">
+            <p className="text-xs text-gray-300">
+              Índice activo: <span className="text-white">{indexStatus.indexed_files}</span> archivos
+            </p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
+                disabled={isIndexing}
+                onClick={() => {
+                  void startIndexing(indexStatus.roots.length > 0 ? indexStatus.roots : ["C:\\"]);
+                }}
+              >
+                {isIndexing ? "Reindexando..." : "Reindexar"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {indexMessage && (
+          <p className="mb-3 text-xs text-center text-gray-400">{indexMessage}</p>
+        )}
+
         <div className="group flex items-center gap-3 rounded-xl bg-white/5 px-4 transition-all duration-300 focus-within:bg-white/10">
           <div className="text-gray-500 group-focus-within:text-blue-400 transition-colors pointer-events-none shrink-0">
             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-search"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>

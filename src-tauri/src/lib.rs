@@ -1,6 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use tauri::{Manager, State};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -14,8 +16,105 @@ struct SearchResultItem {
     snippet: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct IndexedFileItem {
+    title: String,
+    path: String,
+    search_key: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct IndexSnapshot {
+    files: Vec<IndexedFileItem>,
+    roots: Vec<String>,
+    indexed_at: String,
+}
+
+#[derive(Serialize)]
+struct IndexStatus {
+    has_index: bool,
+    indexed_files: usize,
+    indexed_at: Option<String>,
+    roots: Vec<String>,
+}
+
+#[derive(Default)]
+struct AppState {
+    index: Mutex<Option<IndexSnapshot>>,
+}
+
+#[tauri::command]
+fn get_index_status(state: State<'_, AppState>) -> IndexStatus {
+    let guard = match state.index.lock() {
+        Ok(value) => value,
+        Err(_) => {
+            return IndexStatus {
+                has_index: false,
+                indexed_files: 0,
+                indexed_at: None,
+                roots: Vec::new(),
+            }
+        }
+    };
+
+    if let Some(snapshot) = guard.as_ref() {
+        return IndexStatus {
+            has_index: true,
+            indexed_files: snapshot.files.len(),
+            indexed_at: Some(snapshot.indexed_at.clone()),
+            roots: snapshot.roots.clone(),
+        };
+    }
+
+    IndexStatus {
+        has_index: false,
+        indexed_files: 0,
+        indexed_at: None,
+        roots: Vec::new(),
+    }
+}
+
+#[tauri::command]
+fn start_indexing(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    roots: Option<Vec<String>>,
+    excluded_extensions: Option<Vec<String>>,
+) -> Result<IndexStatus, String> {
+    let resolved_roots = resolve_roots(roots);
+    let exclusions = normalize_extensions(excluded_extensions);
+    let indexed_files = build_index_files(&resolved_roots, &exclusions);
+
+    let snapshot = IndexSnapshot {
+        files: indexed_files,
+        roots: resolved_roots
+            .iter()
+            .map(|root| root.to_string_lossy().to_string())
+            .collect(),
+        indexed_at: now_timestamp_string(),
+    };
+
+    save_index_snapshot(&app, &snapshot);
+
+    {
+        let mut guard = state
+            .index
+            .lock()
+            .map_err(|_| "No se pudo bloquear el estado de indexación".to_string())?;
+        *guard = Some(snapshot.clone());
+    }
+
+    Ok(IndexStatus {
+        has_index: true,
+        indexed_files: snapshot.files.len(),
+        indexed_at: Some(snapshot.indexed_at),
+        roots: snapshot.roots,
+    })
+}
+
 #[tauri::command]
 fn search_stub(
+    state: State<'_, AppState>,
     query: &str,
     roots: Option<Vec<String>>,
     excluded_extensions: Option<Vec<String>>,
@@ -29,7 +128,61 @@ fn search_stub(
     let search_roots = resolve_roots(roots);
     let exclusions = normalize_extensions(excluded_extensions);
 
+    if let Some(index_results) = search_in_index(state, clean_query, &search_roots, &exclusions) {
+        return index_results;
+    }
+
     search_local_files(clean_query, &search_roots, &exclusions)
+}
+
+fn search_in_index(
+    state: State<'_, AppState>,
+    query: &str,
+    roots: &[PathBuf],
+    excluded_extensions: &[String],
+) -> Option<Vec<SearchResultItem>> {
+    const MAX_RESULTS: usize = 30;
+
+    let guard = state.index.lock().ok()?;
+    let snapshot = guard.as_ref()?;
+    let query_tokens = tokenize_query(query);
+
+    if query_tokens.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut results = Vec::new();
+
+    for item in &snapshot.files {
+        if results.len() >= MAX_RESULTS {
+            break;
+        }
+
+        let path = PathBuf::from(&item.path);
+        if !matches_roots(&path, roots) {
+            continue;
+        }
+
+        if is_excluded_file(&path, excluded_extensions) {
+            continue;
+        }
+
+        let is_match = query_tokens
+            .iter()
+            .all(|token| item.search_key.contains(token));
+
+        if !is_match {
+            continue;
+        }
+
+        results.push(SearchResultItem {
+            title: item.title.clone(),
+            path: item.path.clone(),
+            snippet: "Coincidencia desde índice local (más rápido).".to_string(),
+        });
+    }
+
+    Some(results)
 }
 
 fn search_local_files(
@@ -133,6 +286,68 @@ fn search_local_files(
     results
 }
 
+fn build_index_files(roots: &[PathBuf], excluded_extensions: &[String]) -> Vec<IndexedFileItem> {
+    const MAX_INDEXED_FILES: usize = 400_000;
+    const MAX_DEPTH: usize = 14;
+
+    let mut indexed = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = roots
+        .iter()
+        .cloned()
+        .map(|path| (path, 0usize))
+        .collect();
+
+    while let Some((current_dir, depth)) = stack.pop() {
+        if indexed.len() >= MAX_INDEXED_FILES {
+            break;
+        }
+
+        if depth > MAX_DEPTH || should_skip_dir(&current_dir) {
+            continue;
+        }
+
+        let read_dir = match fs::read_dir(&current_dir) {
+            Ok(dir) => dir,
+            Err(_) => continue,
+        };
+
+        for entry in read_dir.flatten() {
+            if indexed.len() >= MAX_INDEXED_FILES {
+                break;
+            }
+
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => continue,
+            };
+
+            if file_type.is_dir() {
+                if !should_skip_dir(&path) {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+
+            if !file_type.is_file() || is_excluded_file(&path, excluded_extensions) {
+                continue;
+            }
+
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            indexed.push(IndexedFileItem {
+                title: file_name.to_string(),
+                path: path.to_string_lossy().to_string(),
+                search_key: file_name.to_lowercase(),
+            });
+        }
+    }
+
+    indexed
+}
+
 fn tokenize_query(query: &str) -> Vec<String> {
     query
         .to_lowercase()
@@ -140,6 +355,14 @@ fn tokenize_query(query: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn matches_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    if roots.is_empty() {
+        return true;
+    }
+
+    roots.iter().any(|root| path.starts_with(root))
 }
 
 fn is_drive_root(path: &Path) -> bool {
@@ -240,12 +463,62 @@ fn should_skip_dir(path: &Path) -> bool {
     )
 }
 
+fn now_timestamp_string() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => format!("{}", duration.as_secs()),
+        Err(_) => "0".to_string(),
+    }
+}
+
+fn index_cache_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("index-cache.json");
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    Some(path)
+}
+
+fn save_index_snapshot(app: &tauri::AppHandle, snapshot: &IndexSnapshot) {
+    let Some(path) = index_cache_path(app) else {
+        return;
+    };
+
+    let Ok(serialized) = serde_json::to_string(snapshot) else {
+        return;
+    };
+
+    let _ = fs::write(path, serialized);
+}
+
+fn load_index_snapshot(app: &tauri::AppHandle) -> Option<IndexSnapshot> {
+    let path = index_cache_path(app)?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<IndexSnapshot>(&content).ok()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![greet, search_stub])
+        .setup(|app| {
+            if let Some(snapshot) = load_index_snapshot(app.handle()) {
+                if let Ok(mut guard) = app.state::<AppState>().index.lock() {
+                    *guard = Some(snapshot);
+                }
+            }
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            search_stub,
+            start_indexing,
+            get_index_status
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
