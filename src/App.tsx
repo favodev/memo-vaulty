@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
@@ -22,6 +23,14 @@ type IndexFeedback = {
   text: string;
 };
 
+type IndexProgressEvent = {
+  phase: string;
+  message: string;
+  scanned_files: number;
+  indexed_files: number;
+  done: boolean;
+};
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -37,6 +46,7 @@ function App() {
   const [isIndexing, setIsIndexing] = useState(false);
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [indexFeedback, setIndexFeedback] = useState<IndexFeedback | null>(null);
+  const [indexProgress, setIndexProgress] = useState<IndexProgressEvent | null>(null);
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -66,6 +76,40 @@ function App() {
 
     return () => clearTimeout(timeout);
   }, [indexFeedback]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const attach = async () => {
+      const unlisten = await listen<IndexProgressEvent>("index-progress", (event) => {
+        if (!isMounted) {
+          return;
+        }
+
+        setIndexProgress(event.payload);
+
+        if (event.payload.done) {
+          setTimeout(() => {
+            if (isMounted) {
+              setIndexProgress((current) => (current?.done ? null : current));
+            }
+          }, 2400);
+        }
+      });
+
+      return unlisten;
+    };
+
+    let cleanup: (() => void) | undefined;
+    void attach().then((unlisten) => {
+      cleanup = unlisten;
+    });
+
+    return () => {
+      isMounted = false;
+      cleanup?.();
+    };
+  }, []);
 
   const openFile = async (filePath: string) => {
     try {
@@ -152,6 +196,13 @@ function App() {
     const startedAt = Date.now();
     setIsIndexing(true);
     setIndexFeedback({ type: "running", text: "Indexando..." });
+    setIndexProgress({
+      phase: "start",
+      message: "Preparando indexación...",
+      scanned_files: 0,
+      indexed_files: 0,
+      done: false,
+    });
 
     try {
       const exclusions = excludedExtensions
@@ -340,6 +391,22 @@ function App() {
                 </span>
               )}
             </div>
+
+            {indexProgress && (
+              <div className="mt-2 rounded-md bg-white/5 px-2.5 py-2 ring-1 ring-white/10">
+                <p className="text-[11px] text-gray-300">
+                  {indexProgress.message} · escaneados {indexProgress.scanned_files.toLocaleString()} · indexados{" "}
+                  {indexProgress.indexed_files.toLocaleString()}
+                </p>
+                <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className={`h-full rounded-full transition-all duration-300 ${
+                      indexProgress.done ? "w-full bg-emerald-400/70" : "w-1/2 animate-pulse bg-blue-400/70"
+                    }`}
+                  />
+                </div>
+              </div>
+            )}
 
             {formatIndexedAt(indexStatus.indexed_at) && (
               <p className="mt-1 text-[11px] text-gray-500">

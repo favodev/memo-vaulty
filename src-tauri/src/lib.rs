@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -62,6 +62,15 @@ struct IndexStatus {
     roots: Vec<String>,
 }
 
+#[derive(Clone, Serialize)]
+struct IndexProgressEvent {
+    phase: String,
+    message: String,
+    scanned_files: usize,
+    indexed_files: usize,
+    done: bool,
+}
+
 #[derive(Default)]
 struct AppState {
     index: Mutex<Option<IndexSnapshot>>,
@@ -107,6 +116,15 @@ fn start_indexing(
     excluded_folders: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
 ) -> Result<IndexStatus, String> {
+    emit_index_progress(
+        &app,
+        "start",
+        "Iniciando indexación...",
+        0,
+        0,
+        false,
+    );
+
     let resolved_roots = resolve_roots(roots);
     let exclusions = normalize_extensions(excluded_extensions);
     let folder_exclusions = normalize_folder_rules(excluded_folders);
@@ -118,6 +136,7 @@ fn start_indexing(
         .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.files.clone()));
 
     let indexed_files = build_index_files(
+        &app,
         &resolved_roots,
         &exclusions,
         &folder_exclusions,
@@ -366,6 +385,7 @@ fn search_local_files(
 }
 
 fn build_index_files(
+    app: &tauri::AppHandle,
     roots: &[PathBuf],
     excluded_extensions: &[String],
     excluded_folders: &[String],
@@ -383,11 +403,21 @@ fn build_index_files(
         .collect::<HashMap<String, IndexedFileItem>>();
 
     let mut indexed = Vec::new();
+    let mut scanned_files = 0usize;
     let mut stack: Vec<(PathBuf, usize)> = roots
         .iter()
         .cloned()
         .map(|path| (path, 0usize))
         .collect();
+
+    emit_index_progress(
+        app,
+        "scan",
+        "Escaneando carpetas...",
+        scanned_files,
+        indexed.len(),
+        false,
+    );
 
     while let Some((current_dir, depth)) = stack.pop() {
         if indexed.len() >= MAX_INDEXED_FILES {
@@ -424,6 +454,8 @@ fn build_index_files(
             if !file_type.is_file() || is_excluded_file(&path, excluded_extensions) {
                 continue;
             }
+
+            scanned_files += 1;
 
             let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
@@ -475,10 +507,49 @@ fn build_index_files(
                 modified_unix_secs,
                 content_excerpt,
             });
+
+            if scanned_files % 1500 == 0 {
+                emit_index_progress(
+                    app,
+                    "scan",
+                    "Indexando archivos...",
+                    scanned_files,
+                    indexed.len(),
+                    false,
+                );
+            }
         }
     }
 
+    emit_index_progress(
+        app,
+        "done",
+        "Indexación finalizada",
+        scanned_files,
+        indexed.len(),
+        true,
+    );
+
     indexed
+}
+
+fn emit_index_progress(
+    app: &tauri::AppHandle,
+    phase: &str,
+    message: &str,
+    scanned_files: usize,
+    indexed_files: usize,
+    done: bool,
+) {
+    let payload = IndexProgressEvent {
+        phase: phase.to_string(),
+        message: message.to_string(),
+        scanned_files,
+        indexed_files,
+        done,
+    };
+
+    let _ = app.emit("index-progress", payload);
 }
 
 fn needs_content_refresh(path: &Path, previous: &IndexedFileItem) -> bool {
