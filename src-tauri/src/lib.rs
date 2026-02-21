@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
 
@@ -71,9 +72,50 @@ struct IndexProgressEvent {
     done: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct IndexDiagnostics {
+    scanned_files: usize,
+    indexed_files: usize,
+    pdf_scanned: usize,
+    pdf_indexed: usize,
+    pdf_failed: usize,
+    pdf_failed_examples: Vec<String>,
+    last_error: Option<String>,
+    updated_at: Option<String>,
+    canceled: bool,
+}
+
+struct BuildIndexOutcome {
+    files: Vec<IndexedFileItem>,
+    scanned_files: usize,
+    pdf_scanned: usize,
+    pdf_indexed: usize,
+    pdf_failed: usize,
+    pdf_failed_examples: Vec<String>,
+    canceled: bool,
+}
+
 #[derive(Default)]
 struct AppState {
     index: Mutex<Option<IndexSnapshot>>,
+    diagnostics: Mutex<Option<IndexDiagnostics>>,
+    cancel_indexing: AtomicBool,
+}
+
+#[tauri::command]
+fn cancel_indexing(state: State<'_, AppState>) -> Result<(), String> {
+    state.cancel_indexing.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_index_diagnostics(state: State<'_, AppState>) -> IndexDiagnostics {
+    let guard = match state.diagnostics.lock() {
+        Ok(value) => value,
+        Err(_) => return IndexDiagnostics::default(),
+    };
+
+    guard.clone().unwrap_or_default()
 }
 
 #[tauri::command]
@@ -116,6 +158,8 @@ fn start_indexing(
     excluded_folders: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
 ) -> Result<IndexStatus, String> {
+    state.cancel_indexing.store(false, Ordering::SeqCst);
+
     emit_index_progress(
         &app,
         "start",
@@ -135,8 +179,9 @@ fn start_indexing(
         .ok()
         .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.files.clone()));
 
-    let indexed_files = build_index_files(
+    let build_outcome = build_index_files(
         &app,
+        state.inner(),
         &resolved_roots,
         &exclusions,
         &folder_exclusions,
@@ -144,8 +189,32 @@ fn start_indexing(
         previous_items.as_deref(),
     );
 
+    let diagnostics = IndexDiagnostics {
+        scanned_files: build_outcome.scanned_files,
+        indexed_files: build_outcome.files.len(),
+        pdf_scanned: build_outcome.pdf_scanned,
+        pdf_indexed: build_outcome.pdf_indexed,
+        pdf_failed: build_outcome.pdf_failed,
+        pdf_failed_examples: build_outcome.pdf_failed_examples,
+        last_error: if build_outcome.canceled {
+            Some("Indexación cancelada por el usuario".to_string())
+        } else {
+            None
+        },
+        updated_at: Some(now_timestamp_string()),
+        canceled: build_outcome.canceled,
+    };
+
+    if let Ok(mut guard) = state.diagnostics.lock() {
+        *guard = Some(diagnostics);
+    }
+
+    if build_outcome.canceled {
+        return Err("Indexación cancelada por el usuario".to_string());
+    }
+
     let snapshot = IndexSnapshot {
-        files: indexed_files,
+        files: build_outcome.files,
         roots: resolved_roots
             .iter()
             .map(|root| root.to_string_lossy().to_string())
@@ -386,12 +455,13 @@ fn search_local_files(
 
 fn build_index_files(
     app: &tauri::AppHandle,
+    state: &AppState,
     roots: &[PathBuf],
     excluded_extensions: &[String],
     excluded_folders: &[String],
     max_file_size_bytes: u64,
     previous_items: Option<&[IndexedFileItem]>,
-) -> Vec<IndexedFileItem> {
+) -> BuildIndexOutcome {
     const MAX_INDEXED_FILES: usize = 400_000;
     const MAX_DEPTH: usize = 14;
 
@@ -404,6 +474,10 @@ fn build_index_files(
 
     let mut indexed = Vec::new();
     let mut scanned_files = 0usize;
+    let mut pdf_scanned = 0usize;
+    let mut pdf_indexed = 0usize;
+    let mut pdf_failed = 0usize;
+    let mut pdf_failed_examples: Vec<String> = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = roots
         .iter()
         .cloned()
@@ -420,6 +494,27 @@ fn build_index_files(
     );
 
     while let Some((current_dir, depth)) = stack.pop() {
+        if state.cancel_indexing.load(Ordering::Relaxed) {
+            emit_index_progress(
+                app,
+                "cancelled",
+                "Indexación cancelada",
+                scanned_files,
+                indexed.len(),
+                true,
+            );
+
+            return BuildIndexOutcome {
+                files: indexed,
+                scanned_files,
+                pdf_scanned,
+                pdf_indexed,
+                pdf_failed,
+                pdf_failed_examples,
+                canceled: true,
+            };
+        }
+
         if indexed.len() >= MAX_INDEXED_FILES {
             break;
         }
@@ -434,6 +529,27 @@ fn build_index_files(
         };
 
         for entry in read_dir.flatten() {
+            if state.cancel_indexing.load(Ordering::Relaxed) {
+                emit_index_progress(
+                    app,
+                    "cancelled",
+                    "Indexación cancelada",
+                    scanned_files,
+                    indexed.len(),
+                    true,
+                );
+
+                return BuildIndexOutcome {
+                    files: indexed,
+                    scanned_files,
+                    pdf_scanned,
+                    pdf_indexed,
+                    pdf_failed,
+                    pdf_failed_examples,
+                    canceled: true,
+                };
+            }
+
             if indexed.len() >= MAX_INDEXED_FILES {
                 break;
             }
@@ -456,6 +572,18 @@ fn build_index_files(
             }
 
             scanned_files += 1;
+
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_lowercase())
+                .unwrap_or_default();
+
+            let is_pdf = extension == "pdf";
+
+            if is_pdf {
+                pdf_scanned += 1;
+            }
 
             let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
@@ -486,12 +614,51 @@ fn build_index_files(
                     && previous.modified_unix_secs == modified_unix_secs
                     && !needs_content_refresh(&path, previous)
                 {
+                    if is_pdf {
+                        if previous.content_excerpt.is_some() {
+                            pdf_indexed += 1;
+                        } else {
+                            pdf_failed += 1;
+                        }
+                    }
+
                     indexed.push(previous.clone());
                     continue;
                 }
             }
 
-            let content_excerpt = extract_indexable_text(&path);
+            let content_excerpt = if is_pdf {
+                match extract_pdf_text(&path) {
+                    Some(text) => {
+                        let normalized = normalize_text_for_index(&text, 120_000);
+                        if normalized.is_empty() {
+                            pdf_failed += 1;
+                            if pdf_failed_examples.len() < 5 {
+                                pdf_failed_examples.push(format!(
+                                    "{} (sin texto extraíble)",
+                                    full_path
+                                ));
+                            }
+                            None
+                        } else {
+                            pdf_indexed += 1;
+                            Some(normalized)
+                        }
+                    }
+                    None => {
+                        pdf_failed += 1;
+                        if pdf_failed_examples.len() < 5 {
+                            pdf_failed_examples.push(format!(
+                                "{} (error al extraer)",
+                                full_path
+                            ));
+                        }
+                        None
+                    }
+                }
+            } else {
+                extract_indexable_text(&path)
+            };
             let mut search_key = file_name.to_lowercase();
 
             if let Some(content) = &content_excerpt {
@@ -530,7 +697,15 @@ fn build_index_files(
         true,
     );
 
-    indexed
+    BuildIndexOutcome {
+        files: indexed,
+        scanned_files,
+        pdf_scanned,
+        pdf_indexed,
+        pdf_failed,
+        pdf_failed_examples,
+        canceled: false,
+    }
 }
 
 fn emit_index_progress(
@@ -573,16 +748,6 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_lowercase())?;
-
-    if extension == "pdf" {
-        let text = extract_pdf_text(path)?;
-        let normalized = normalize_text_for_index(&text, 120_000);
-        return if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
-        };
-    }
 
     if extension != "txt" && extension != "md" {
         return None;
@@ -843,7 +1008,9 @@ pub fn run() {
             open_file,
             search_stub,
             start_indexing,
-            get_index_status
+            get_index_status,
+            get_index_diagnostics,
+            cancel_indexing
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -31,6 +31,18 @@ type IndexProgressEvent = {
   done: boolean;
 };
 
+type IndexDiagnostics = {
+  scanned_files: number;
+  indexed_files: number;
+  pdf_scanned: number;
+  pdf_indexed: number;
+  pdf_failed: number;
+  pdf_failed_examples: string[];
+  last_error: string | null;
+  updated_at: string | null;
+  canceled: boolean;
+};
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -47,6 +59,7 @@ function App() {
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [indexFeedback, setIndexFeedback] = useState<IndexFeedback | null>(null);
   const [indexProgress, setIndexProgress] = useState<IndexProgressEvent | null>(null);
+  const [indexDiagnostics, setIndexDiagnostics] = useState<IndexDiagnostics | null>(null);
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -55,6 +68,13 @@ function App() {
         setIndexStatus(status);
       } catch {
         setIndexStatus(null);
+      }
+
+      try {
+        const diagnostics = await invoke<IndexDiagnostics>("get_index_diagnostics");
+        setIndexDiagnostics(diagnostics);
+      } catch {
+        setIndexDiagnostics(null);
       }
     };
 
@@ -89,6 +109,10 @@ function App() {
         setIndexProgress(event.payload);
 
         if (event.payload.done) {
+          void invoke<IndexDiagnostics>("get_index_diagnostics")
+            .then((diagnostics) => setIndexDiagnostics(diagnostics))
+            .catch(() => setIndexDiagnostics(null));
+
           setTimeout(() => {
             if (isMounted) {
               setIndexProgress((current) => (current?.done ? null : current));
@@ -226,13 +250,40 @@ function App() {
       });
 
       setIndexStatus(status);
+      try {
+        const diagnostics = await invoke<IndexDiagnostics>("get_index_diagnostics");
+        setIndexDiagnostics(diagnostics);
+      } catch {
+        setIndexDiagnostics(null);
+      }
+
       if (status.roots.length > 0) {
         setSearchRoots(status.roots);
       }
       setIndexFeedback({ type: "success", text: "Reindexación hecha" });
-    } catch {
-      setErrorMessage("Falló la indexación local. Intenta con una carpeta más pequeña primero.");
-      setIndexFeedback({ type: "error", text: "Reindexación falló" });
+    } catch (error) {
+      const maybeMessage =
+        typeof error === "string"
+          ? error
+          : error && typeof error === "object" && "message" in error && typeof error.message === "string"
+          ? error.message
+          : "";
+
+      const cancelled = maybeMessage.toLowerCase().includes("cancelada");
+
+      if (cancelled) {
+        setIndexFeedback({ type: "error", text: "Indexación cancelada" });
+      } else {
+        setErrorMessage("Falló la indexación local. Intenta con una carpeta más pequeña primero.");
+        setIndexFeedback({ type: "error", text: "Reindexación falló" });
+      }
+
+      try {
+        const diagnostics = await invoke<IndexDiagnostics>("get_index_diagnostics");
+        setIndexDiagnostics(diagnostics);
+      } catch {
+        setIndexDiagnostics(null);
+      }
     } finally {
       const elapsed = Date.now() - startedAt;
       const minVisibleMs = 900;
@@ -240,6 +291,15 @@ function App() {
         await new Promise((resolve) => setTimeout(resolve, minVisibleMs - elapsed));
       }
       setIsIndexing(false);
+    }
+  };
+
+  const cancelIndexing = async () => {
+    try {
+      await invoke("cancel_indexing");
+      setIndexFeedback({ type: "running", text: "Cancelando indexación..." });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo cancelar" });
     }
   };
 
@@ -377,6 +437,18 @@ function App() {
                 {isIndexing ? "Reindexando..." : "Reindexar"}
               </button>
 
+              {isIndexing && (
+                <button
+                  type="button"
+                  className="rounded-md bg-red-500/20 px-2.5 py-1 text-[11px] text-red-300 ring-1 ring-red-400/30 transition-colors hover:bg-red-500/30"
+                  onClick={() => {
+                    void cancelIndexing();
+                  }}
+                >
+                  Cancelar
+                </button>
+              )}
+
               {indexFeedback && (
                 <span
                   className={`inline-flex items-center rounded-md px-2.5 py-1 text-[11px] ${
@@ -407,6 +479,34 @@ function App() {
                 </div>
               </div>
             )}
+
+            {indexDiagnostics &&
+              (indexDiagnostics.scanned_files > 0 || indexDiagnostics.pdf_scanned > 0 || Boolean(indexDiagnostics.last_error)) && (
+                <div className="mt-2 rounded-md bg-white/5 px-2.5 py-2 ring-1 ring-white/10">
+                  <p className="text-[11px] text-gray-300">
+                    Diagnóstico: escaneados {indexDiagnostics.scanned_files.toLocaleString()} · indexados{" "}
+                    {indexDiagnostics.indexed_files.toLocaleString()} · PDF {indexDiagnostics.pdf_indexed.toLocaleString()}/
+                    {indexDiagnostics.pdf_scanned.toLocaleString()} ok
+                  </p>
+                  {indexDiagnostics.pdf_failed > 0 && (
+                    <p className="mt-1 text-[11px] text-amber-300">
+                      PDFs sin texto extraíble: {indexDiagnostics.pdf_failed.toLocaleString()}
+                    </p>
+                  )}
+                  {indexDiagnostics.last_error && (
+                    <p className="mt-1 text-[11px] text-red-300">{indexDiagnostics.last_error}</p>
+                  )}
+                  {indexDiagnostics.pdf_failed_examples.length > 0 && (
+                    <div className="mt-1 space-y-1">
+                      {indexDiagnostics.pdf_failed_examples.slice(0, 3).map((example) => (
+                        <p key={example} className="truncate text-[10px] text-gray-500">
+                          {example}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
             {formatIndexedAt(indexStatus.indexed_at) && (
               <p className="mt-1 text-[11px] text-gray-500">
