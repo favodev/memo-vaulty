@@ -43,6 +43,24 @@ type IndexDiagnostics = {
   canceled: boolean;
 };
 
+type AiProviderStatus = {
+  configured: boolean;
+  provider: string;
+  base_url: string;
+  embedding_model: string;
+  api_key_hint: string | null;
+};
+
+type FileWatcherStatus = {
+  running: boolean;
+  roots: string[];
+  pending_events: boolean;
+  debounce_ms: number;
+  last_event_at: string | null;
+  last_reindex_at: string | null;
+  last_error: string | null;
+};
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -60,6 +78,13 @@ function App() {
   const [indexFeedback, setIndexFeedback] = useState<IndexFeedback | null>(null);
   const [indexProgress, setIndexProgress] = useState<IndexProgressEvent | null>(null);
   const [indexDiagnostics, setIndexDiagnostics] = useState<IndexDiagnostics | null>(null);
+  const [aiProviderStatus, setAiProviderStatus] = useState<AiProviderStatus | null>(null);
+  const [aiApiKey, setAiApiKey] = useState("");
+  const [aiModel, setAiModel] = useState("text-embedding-3-small");
+  const [aiBaseUrl, setAiBaseUrl] = useState("https://openrouter.ai/api/v1/embeddings");
+  const [isSavingAi, setIsSavingAi] = useState(false);
+  const [watcherStatus, setWatcherStatus] = useState<FileWatcherStatus | null>(null);
+  const [isWatcherLoading, setIsWatcherLoading] = useState(false);
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -76,10 +101,40 @@ function App() {
       } catch {
         setIndexDiagnostics(null);
       }
+
+      try {
+        const status = await invoke<AiProviderStatus>("get_ai_provider_status");
+        setAiProviderStatus(status);
+        setAiModel(status.embedding_model);
+        setAiBaseUrl(status.base_url);
+      } catch {
+        setAiProviderStatus(null);
+      }
+
+      try {
+        const watcher = await invoke<FileWatcherStatus>("get_file_watcher_status");
+        setWatcherStatus(watcher);
+      } catch {
+        setWatcherStatus(null);
+      }
     };
 
     void loadStatus();
   }, []);
+
+  useEffect(() => {
+    if (!watcherStatus?.running) {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      void invoke<FileWatcherStatus>("get_file_watcher_status")
+        .then((status) => setWatcherStatus(status))
+        .catch(() => undefined);
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [watcherStatus?.running]);
 
   useEffect(() => {
     if (!indexFeedback) {
@@ -176,13 +231,27 @@ function App() {
       const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
       const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
 
-      const response = await invoke<SearchResultItem[]>("search_stub", {
-        query: cleanQuery,
-        roots: searchRoots,
-        excludedExtensions: exclusions,
-        excludedFolders: excludedFolderRules,
-        maxFileSizeMb: maxSizeValue,
-      });
+      let response: SearchResultItem[] = [];
+
+      try {
+        response = await invoke<SearchResultItem[]>("semantic_search", {
+          query: cleanQuery,
+          limit: 30,
+          roots: searchRoots,
+          excludedExtensions: exclusions,
+          excludedFolders: excludedFolderRules,
+          maxFileSizeMb: maxSizeValue,
+        });
+      } catch {
+        response = await invoke<SearchResultItem[]>("search_stub", {
+          query: cleanQuery,
+          roots: searchRoots,
+          excludedExtensions: exclusions,
+          excludedFolders: excludedFolderRules,
+          maxFileSizeMb: maxSizeValue,
+        });
+      }
+
       setResults(response);
       setSelectedIndex(response.length > 0 ? 0 : -1);
     } catch {
@@ -300,6 +369,80 @@ function App() {
       setIndexFeedback({ type: "running", text: "Cancelando indexación..." });
     } catch {
       setIndexFeedback({ type: "error", text: "No se pudo cancelar" });
+    }
+  };
+
+  const saveAiProvider = async () => {
+    if (!aiApiKey.trim()) {
+      setErrorMessage("Debes ingresar una API key para guardar la config de IA.");
+      return;
+    }
+
+    setIsSavingAi(true);
+    setErrorMessage(null);
+
+    try {
+      const status = await invoke<AiProviderStatus>("configure_ai_provider", {
+        apiKey: aiApiKey,
+        embeddingModel: aiModel,
+        baseUrl: aiBaseUrl,
+      });
+
+      setAiProviderStatus(status);
+      setAiApiKey("");
+      setIndexFeedback({ type: "success", text: "IA configurada" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo guardar IA" });
+    } finally {
+      setIsSavingAi(false);
+    }
+  };
+
+  const startWatcher = async () => {
+    setIsWatcherLoading(true);
+
+    try {
+      const exclusions = excludedExtensions
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const excludedFolderRules = excludedFolders
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
+      const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+
+      const status = await invoke<FileWatcherStatus>("start_file_watcher", {
+        roots: searchRoots,
+        excludedExtensions: exclusions,
+        excludedFolders: excludedFolderRules,
+        maxFileSizeMb: maxSizeValue,
+        debounceMs: 1200,
+      });
+
+      setWatcherStatus(status);
+      setIndexFeedback({ type: "success", text: "Watcher activo" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo iniciar watcher" });
+    } finally {
+      setIsWatcherLoading(false);
+    }
+  };
+
+  const stopWatcher = async () => {
+    setIsWatcherLoading(true);
+
+    try {
+      const status = await invoke<FileWatcherStatus>("stop_file_watcher");
+      setWatcherStatus(status);
+      setIndexFeedback({ type: "success", text: "Watcher detenido" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo detener watcher" });
+    } finally {
+      setIsWatcherLoading(false);
     }
   };
 
@@ -508,6 +651,23 @@ function App() {
                 </div>
               )}
 
+            {watcherStatus && (
+              <div className="mt-2 rounded-md bg-white/5 px-2.5 py-2 ring-1 ring-white/10">
+                <p className="text-[11px] text-gray-300">
+                  Watcher: {watcherStatus.running ? "activo" : "detenido"}
+                  {watcherStatus.pending_events ? " · cambios detectados" : ""}
+                </p>
+                {watcherStatus.last_reindex_at && (
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    Última auto-indexación: {formatIndexedAt(watcherStatus.last_reindex_at)}
+                  </p>
+                )}
+                {watcherStatus.last_error && (
+                  <p className="mt-1 text-[11px] text-amber-300">{watcherStatus.last_error}</p>
+                )}
+              </div>
+            )}
+
             {formatIndexedAt(indexStatus.indexed_at) && (
               <p className="mt-1 text-[11px] text-gray-500">
                 Última indexación: {formatIndexedAt(indexStatus.indexed_at)}
@@ -714,6 +874,111 @@ function App() {
                     value={maxFileSizeMb}
                     onChange={(e) => setMaxFileSizeMb(e.target.value)}
                   />
+                </div>
+
+                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-gray-400">Embeddings IA (API)</p>
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    Activa ranking semántico real usando endpoint compatible OpenRouter/OpenAI.
+                  </p>
+
+                  <div className="mt-3 space-y-2">
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-gray-500" htmlFor="ai-api-key">
+                        API key
+                      </label>
+                      <input
+                        id="ai-api-key"
+                        type="password"
+                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                        placeholder="sk-or-v1-..."
+                        value={aiApiKey}
+                        onChange={(e) => setAiApiKey(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-gray-500" htmlFor="ai-model">
+                        Modelo de embedding
+                      </label>
+                      <input
+                        id="ai-model"
+                        type="text"
+                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                        placeholder="text-embedding-3-small"
+                        value={aiModel}
+                        onChange={(e) => setAiModel(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-gray-500" htmlFor="ai-base-url">
+                        Endpoint embeddings
+                      </label>
+                      <input
+                        id="ai-base-url"
+                        type="text"
+                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                        placeholder="https://openrouter.ai/api/v1/embeddings"
+                        value={aiBaseUrl}
+                        onChange={(e) => setAiBaseUrl(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex items-center gap-2">
+                    <button
+                      type="button"
+                      className="rounded-md bg-indigo-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-indigo-500"
+                      disabled={isSavingAi}
+                      onClick={() => {
+                        void saveAiProvider();
+                      }}
+                    >
+                      {isSavingAi ? "Guardando..." : "Guardar IA"}
+                    </button>
+
+                    {aiProviderStatus?.configured && (
+                      <span className="text-[11px] text-emerald-300">
+                        Configurada ({aiProviderStatus.api_key_hint ?? "key oculta"})
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-gray-400">File Watcher (tiempo real)</p>
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    Vigila cambios en disco y dispara reindexado automático con debounce.
+                  </p>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="rounded-md bg-blue-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-blue-500"
+                      disabled={isWatcherLoading || Boolean(watcherStatus?.running)}
+                      onClick={() => {
+                        void startWatcher();
+                      }}
+                    >
+                      {isWatcherLoading && !watcherStatus?.running ? "Iniciando..." : "Iniciar watcher"}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      disabled={isWatcherLoading || !watcherStatus?.running}
+                      onClick={() => {
+                        void stopWatcher();
+                      }}
+                    >
+                      {isWatcherLoading && watcherStatus?.running ? "Deteniendo..." : "Detener watcher"}
+                    </button>
+
+                    <span className="text-[11px] text-gray-400">
+                      Estado: {watcherStatus?.running ? "activo" : "detenido"}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="flex flex-wrap gap-2 pt-1">

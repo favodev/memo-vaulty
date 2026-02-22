@@ -3,8 +3,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
+use rusqlite::{params, params_from_iter, Connection};
 use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
@@ -95,11 +99,89 @@ struct BuildIndexOutcome {
     canceled: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct AiProviderConfig {
+    provider: String,
+    base_url: String,
+    embedding_model: String,
+    api_key: String,
+}
+
+#[derive(Serialize)]
+struct AiProviderStatus {
+    configured: bool,
+    provider: String,
+    base_url: String,
+    embedding_model: String,
+    api_key_hint: Option<String>,
+}
+
+#[derive(Clone)]
+struct ChunkCandidate {
+    title: String,
+    path: String,
+    chunk_text: String,
+    lexical_score: f32,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingDataItem>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingDataItem {
+    embedding: Vec<f32>,
+}
+
+#[derive(Clone)]
+struct IndexingSettings {
+    roots: Vec<String>,
+    excluded_extensions: Vec<String>,
+    excluded_folders: Vec<String>,
+    max_file_size_mb: u64,
+}
+
+struct FileWatcherRuntime {
+    stop_flag: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct FileWatcherStatus {
+    running: bool,
+    roots: Vec<String>,
+    pending_events: bool,
+    debounce_ms: u64,
+    last_event_at: Option<String>,
+    last_reindex_at: Option<String>,
+    last_error: Option<String>,
+}
+
 struct AppState {
     index: Mutex<Option<IndexSnapshot>>,
     diagnostics: Mutex<Option<IndexDiagnostics>>,
     cancel_indexing: AtomicBool,
+    ai_config: Mutex<Option<AiProviderConfig>>,
+    index_settings: Mutex<IndexingSettings>,
+    watcher_runtime: Mutex<Option<FileWatcherRuntime>>,
+    watcher_status: Mutex<FileWatcherStatus>,
+    is_indexing: AtomicBool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            index: Mutex::new(None),
+            diagnostics: Mutex::new(None),
+            cancel_indexing: AtomicBool::new(false),
+            ai_config: Mutex::new(None),
+            index_settings: Mutex::new(default_indexing_settings()),
+            watcher_runtime: Mutex::new(None),
+            watcher_status: Mutex::new(FileWatcherStatus::default()),
+            is_indexing: AtomicBool::new(false),
+        }
+    }
 }
 
 #[tauri::command]
@@ -116,6 +198,248 @@ fn get_index_diagnostics(state: State<'_, AppState>) -> IndexDiagnostics {
     };
 
     guard.clone().unwrap_or_default()
+}
+
+#[tauri::command]
+fn get_file_watcher_status(state: State<'_, AppState>) -> FileWatcherStatus {
+    state
+        .watcher_status
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn start_file_watcher(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    roots: Option<Vec<String>>,
+    excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+    debounce_ms: Option<u64>,
+) -> Result<FileWatcherStatus, String> {
+    if state
+        .watcher_runtime
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
+    {
+        return get_existing_watcher_status(state.inner());
+    }
+
+    let settings = merge_indexing_settings(
+        state.inner(),
+        roots,
+        excluded_extensions,
+        excluded_folders,
+        max_file_size_mb,
+    )?;
+
+    let debounce_value = debounce_ms.unwrap_or(1200).clamp(300, 30_000);
+    let root_paths = resolve_roots(Some(settings.roots.clone()));
+
+    if root_paths.is_empty() {
+        return Err("No hay carpetas válidas para vigilar".to_string());
+    }
+
+    update_watcher_status(state.inner(), |status| {
+        status.running = true;
+        status.roots = root_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        status.pending_events = false;
+        status.debounce_ms = debounce_value;
+        status.last_error = None;
+    });
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_thread = stop_flag.clone();
+    let app_handle = app.clone();
+    let watched_roots = root_paths;
+
+    let thread = std::thread::spawn(move || {
+        run_file_watcher_loop(&app_handle, watched_roots, debounce_value, stop_flag_thread);
+    });
+
+    {
+        let mut guard = state
+            .watcher_runtime
+            .lock()
+            .map_err(|_| "No se pudo actualizar watcher runtime".to_string())?;
+        *guard = Some(FileWatcherRuntime { stop_flag, thread });
+    }
+
+    get_existing_watcher_status(state.inner())
+}
+
+#[tauri::command]
+fn stop_file_watcher(state: State<'_, AppState>) -> Result<FileWatcherStatus, String> {
+    let runtime = {
+        let mut guard = state
+            .watcher_runtime
+            .lock()
+            .map_err(|_| "No se pudo acceder al watcher runtime".to_string())?;
+        guard.take()
+    };
+
+    if let Some(runtime) = runtime {
+        runtime.stop_flag.store(true, Ordering::SeqCst);
+        let _ = runtime.thread.join();
+    }
+
+    update_watcher_status(state.inner(), |status| {
+        status.running = false;
+        status.pending_events = false;
+    });
+
+    get_existing_watcher_status(state.inner())
+}
+
+#[tauri::command]
+fn configure_ai_provider(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    api_key: String,
+    embedding_model: Option<String>,
+    base_url: Option<String>,
+) -> Result<AiProviderStatus, String> {
+    let trimmed_key = api_key.trim().to_string();
+    if trimmed_key.is_empty() {
+        return Err("API key vacía".to_string());
+    }
+
+    let config = AiProviderConfig {
+        provider: "openrouter-compatible".to_string(),
+        base_url: base_url
+            .unwrap_or_else(|| "https://openrouter.ai/api/v1/embeddings".to_string())
+            .trim()
+            .to_string(),
+        embedding_model: embedding_model
+            .unwrap_or_else(|| "text-embedding-3-small".to_string())
+            .trim()
+            .to_string(),
+        api_key: trimmed_key,
+    };
+
+    save_ai_provider_config(&app, &config)?;
+
+    {
+        let mut guard = state
+            .ai_config
+            .lock()
+            .map_err(|_| "No se pudo actualizar la config de IA".to_string())?;
+        *guard = Some(config.clone());
+    }
+
+    Ok(ai_provider_status_from_config(Some(&config)))
+}
+
+#[tauri::command]
+fn get_ai_provider_status(state: State<'_, AppState>) -> AiProviderStatus {
+    let guard = state.ai_config.lock().ok();
+    let maybe_cfg = guard.and_then(|value| value.as_ref().cloned());
+    ai_provider_status_from_config(maybe_cfg.as_ref())
+}
+
+#[tauri::command]
+async fn semantic_search(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+    roots: Option<Vec<String>>,
+    excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+) -> Result<Vec<SearchResultItem>, String> {
+    let clean_query = query.trim();
+    if clean_query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let search_roots = resolve_roots(roots);
+    let exclusions = normalize_extensions(excluded_extensions);
+    let folder_exclusions = normalize_folder_rules(excluded_folders);
+    let max_file_size_bytes = max_size_bytes(max_file_size_mb);
+
+    let mut candidates = load_chunk_candidates(
+        &app,
+        clean_query,
+        &search_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+        80,
+    )?;
+
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ai_cfg = state
+        .ai_config
+        .lock()
+        .ok()
+        .and_then(|value| value.as_ref().cloned());
+
+    let max_results = limit.unwrap_or(20).clamp(1, 50);
+
+    if let Some(config) = ai_cfg {
+        let mut inputs = Vec::with_capacity(candidates.len() + 1);
+        inputs.push(clean_query.to_string());
+        for candidate in &candidates {
+            let trimmed = candidate.chunk_text.chars().take(1_500).collect::<String>();
+            inputs.push(trimmed);
+        }
+
+        let vectors = request_embeddings(&config, &inputs).await?;
+        if vectors.len() == inputs.len() {
+            let query_vector = &vectors[0];
+            let mut scored = Vec::new();
+
+            for (index, candidate) in candidates.drain(..).enumerate() {
+                let semantic = cosine_similarity(query_vector, &vectors[index + 1]);
+                let blended = semantic * 0.72 + candidate.lexical_score * 0.28;
+                scored.push((blended, candidate));
+            }
+
+            scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+
+            let results = scored
+                .into_iter()
+                .take(max_results)
+                .map(|(score, item)| SearchResultItem {
+                    title: item.title,
+                    path: item.path,
+                    snippet: format!(
+                        "Semántico {:.2} · {}",
+                        score,
+                        build_chunk_snippet(&item.chunk_text, clean_query)
+                    ),
+                })
+                .collect();
+
+            return Ok(results);
+        }
+    }
+
+    let mut lexical = candidates
+        .into_iter()
+        .map(|item| SearchResultItem {
+            title: item.title,
+            path: item.path,
+            snippet: format!(
+                "Léxico {:.2} · {}",
+                item.lexical_score,
+                build_chunk_snippet(&item.chunk_text, clean_query)
+            ),
+        })
+        .collect::<Vec<_>>();
+
+    lexical.truncate(max_results);
+    Ok(lexical)
 }
 
 #[tauri::command]
@@ -158,90 +482,20 @@ fn start_indexing(
     excluded_folders: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
 ) -> Result<IndexStatus, String> {
-    state.cancel_indexing.store(false, Ordering::SeqCst);
-
-    emit_index_progress(
-        &app,
-        "start",
-        "Iniciando indexación...",
-        0,
-        0,
-        false,
-    );
-
-    let resolved_roots = resolve_roots(roots);
-    let exclusions = normalize_extensions(excluded_extensions);
-    let folder_exclusions = normalize_folder_rules(excluded_folders);
-    let max_file_size_bytes = max_size_bytes(max_file_size_mb);
-    let previous_items = state
-        .index
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.files.clone()));
-
-    let build_outcome = build_index_files(
-        &app,
+    let settings = merge_indexing_settings(
         state.inner(),
-        &resolved_roots,
-        &exclusions,
-        &folder_exclusions,
-        max_file_size_bytes,
-        previous_items.as_deref(),
-    );
+        roots,
+        excluded_extensions,
+        excluded_folders,
+        max_file_size_mb,
+    )?;
 
-    let diagnostics = IndexDiagnostics {
-        scanned_files: build_outcome.scanned_files,
-        indexed_files: build_outcome.files.len(),
-        pdf_scanned: build_outcome.pdf_scanned,
-        pdf_indexed: build_outcome.pdf_indexed,
-        pdf_failed: build_outcome.pdf_failed,
-        pdf_failed_examples: build_outcome.pdf_failed_examples,
-        last_error: if build_outcome.canceled {
-            Some("Indexación cancelada por el usuario".to_string())
-        } else {
-            None
-        },
-        updated_at: Some(now_timestamp_string()),
-        canceled: build_outcome.canceled,
-    };
-
-    if let Ok(mut guard) = state.diagnostics.lock() {
-        *guard = Some(diagnostics);
-    }
-
-    if build_outcome.canceled {
-        return Err("Indexación cancelada por el usuario".to_string());
-    }
-
-    let snapshot = IndexSnapshot {
-        files: build_outcome.files,
-        roots: resolved_roots
-            .iter()
-            .map(|root| root.to_string_lossy().to_string())
-            .collect(),
-        indexed_at: now_timestamp_string(),
-    };
-
-    save_index_snapshot(&app, &snapshot);
-
-    {
-        let mut guard = state
-            .index
-            .lock()
-            .map_err(|_| "No se pudo bloquear el estado de indexación".to_string())?;
-        *guard = Some(snapshot.clone());
-    }
-
-    Ok(IndexStatus {
-        has_index: true,
-        indexed_files: snapshot.files.len(),
-        indexed_at: Some(snapshot.indexed_at),
-        roots: snapshot.roots,
-    })
+    execute_indexing(&app, state.inner(), settings, "manual")
 }
 
 #[tauri::command]
 fn search_stub(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     query: &str,
     roots: Option<Vec<String>>,
@@ -260,6 +514,20 @@ fn search_stub(
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
 
+    if let Ok(db_results) = search_in_chunk_db(
+        &app,
+        clean_query,
+        &search_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+        30,
+    ) {
+        if !db_results.is_empty() {
+            return db_results;
+        }
+    }
+
     if let Some(index_results) = search_in_index(
         state,
         clean_query,
@@ -277,6 +545,288 @@ fn search_stub(
         &exclusions,
         &folder_exclusions,
         max_file_size_bytes,
+    )
+}
+
+fn execute_indexing(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    settings: IndexingSettings,
+    reason: &str,
+) -> Result<IndexStatus, String> {
+    if state
+        .is_indexing
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("Ya hay una indexación en curso".to_string());
+    }
+
+    let result = (|| {
+        state.cancel_indexing.store(false, Ordering::SeqCst);
+
+        emit_index_progress(
+            app,
+            "start",
+            "Iniciando indexación...",
+            0,
+            0,
+            false,
+        );
+
+        let resolved_roots = resolve_roots(Some(settings.roots.clone()));
+        let exclusions = normalize_extensions(Some(settings.excluded_extensions.clone()));
+        let folder_exclusions = normalize_folder_rules(Some(settings.excluded_folders.clone()));
+        let max_file_size_bytes = max_size_bytes(Some(settings.max_file_size_mb));
+
+        let previous_items = state
+            .index
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.files.clone()));
+
+        let build_outcome = build_index_files(
+            app,
+            state,
+            &resolved_roots,
+            &exclusions,
+            &folder_exclusions,
+            max_file_size_bytes,
+            previous_items.as_deref(),
+        );
+
+        let diagnostics = IndexDiagnostics {
+            scanned_files: build_outcome.scanned_files,
+            indexed_files: build_outcome.files.len(),
+            pdf_scanned: build_outcome.pdf_scanned,
+            pdf_indexed: build_outcome.pdf_indexed,
+            pdf_failed: build_outcome.pdf_failed,
+            pdf_failed_examples: build_outcome.pdf_failed_examples,
+            last_error: if build_outcome.canceled {
+                Some("Indexación cancelada por el usuario".to_string())
+            } else {
+                None
+            },
+            updated_at: Some(now_timestamp_string()),
+            canceled: build_outcome.canceled,
+        };
+
+        if let Ok(mut guard) = state.diagnostics.lock() {
+            *guard = Some(diagnostics);
+        }
+
+        if build_outcome.canceled {
+            return Err("Indexación cancelada por el usuario".to_string());
+        }
+
+        let snapshot = IndexSnapshot {
+            files: build_outcome.files,
+            roots: resolved_roots
+                .iter()
+                .map(|root| root.to_string_lossy().to_string())
+                .collect(),
+            indexed_at: now_timestamp_string(),
+        };
+
+        if let Err(err) = rebuild_chunk_db(app, &snapshot.files) {
+            if let Ok(mut guard) = state.diagnostics.lock() {
+                if let Some(current) = guard.as_mut() {
+                    current.last_error = Some(format!("Indexado hecho, pero BDD de chunks falló: {err}"));
+                    current.updated_at = Some(now_timestamp_string());
+                }
+            }
+        }
+
+        save_index_snapshot(app, &snapshot);
+
+        {
+            let mut guard = state
+                .index
+                .lock()
+                .map_err(|_| "No se pudo bloquear el estado de indexación".to_string())?;
+            *guard = Some(snapshot.clone());
+        }
+
+        if reason == "watcher" {
+            update_watcher_status(state, |status| {
+                status.last_reindex_at = Some(now_timestamp_string());
+                status.last_error = None;
+            });
+        }
+
+        Ok(IndexStatus {
+            has_index: true,
+            indexed_files: snapshot.files.len(),
+            indexed_at: Some(snapshot.indexed_at),
+            roots: snapshot.roots,
+        })
+    })();
+
+    state.is_indexing.store(false, Ordering::SeqCst);
+    result
+}
+
+fn merge_indexing_settings(
+    state: &AppState,
+    roots: Option<Vec<String>>,
+    excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+) -> Result<IndexingSettings, String> {
+    let mut guard = state
+        .index_settings
+        .lock()
+        .map_err(|_| "No se pudo leer config de indexación".to_string())?;
+
+    if let Some(roots) = roots {
+        guard.roots = roots;
+    }
+
+    if let Some(exts) = excluded_extensions {
+        guard.excluded_extensions = exts;
+    }
+
+    if let Some(folders) = excluded_folders {
+        guard.excluded_folders = folders;
+    }
+
+    if let Some(max_mb) = max_file_size_mb {
+        guard.max_file_size_mb = max_mb.max(1);
+    }
+
+    Ok(guard.clone())
+}
+
+fn default_indexing_settings() -> IndexingSettings {
+    IndexingSettings {
+        roots: Vec::new(),
+        excluded_extensions: vec!["mkv".to_string(), "mp4".to_string(), "zip".to_string()],
+        excluded_folders: vec![
+            "node_modules".to_string(),
+            ".git".to_string(),
+            "target".to_string(),
+            "AppData".to_string(),
+        ],
+        max_file_size_mb: 128,
+    }
+}
+
+fn get_existing_watcher_status(state: &AppState) -> Result<FileWatcherStatus, String> {
+    state
+        .watcher_status
+        .lock()
+        .map(|value| value.clone())
+        .map_err(|_| "No se pudo leer estado del watcher".to_string())
+}
+
+fn update_watcher_status<F>(state: &AppState, mut updater: F)
+where
+    F: FnMut(&mut FileWatcherStatus),
+{
+    if let Ok(mut guard) = state.watcher_status.lock() {
+        updater(&mut guard);
+    }
+}
+
+fn run_file_watcher_loop(
+    app: &tauri::AppHandle,
+    roots: Vec<PathBuf>,
+    debounce_ms: u64,
+    stop_flag: Arc<AtomicBool>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<notify::Event, notify::Error>>();
+    let app_handle = app.clone();
+
+    let mut watcher = match recommended_watcher(move |result| {
+        let _ = tx.send(result);
+    }) {
+        Ok(value) => value,
+        Err(err) => {
+            let app_state = app_handle.state::<AppState>();
+            update_watcher_status(app_state.inner(), |status| {
+                status.running = false;
+                status.last_error = Some(format!("Watcher no pudo iniciar: {err}"));
+            });
+            return;
+        }
+    };
+
+    for root in &roots {
+        if let Err(err) = watcher.watch(root, RecursiveMode::Recursive) {
+            let app_state = app_handle.state::<AppState>();
+            update_watcher_status(app_state.inner(), |status| {
+                status.last_error = Some(format!("No se pudo vigilar {}: {err}", root.to_string_lossy()));
+            });
+        }
+    }
+
+    let mut pending_events = false;
+    let mut last_event_time: Option<Instant> = None;
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(event)) => {
+                if !is_relevant_watch_event(&event.kind) {
+                    continue;
+                }
+
+                pending_events = true;
+                last_event_time = Some(Instant::now());
+
+                let app_state = app_handle.state::<AppState>();
+                update_watcher_status(app_state.inner(), |status| {
+                    status.pending_events = true;
+                    status.last_event_at = Some(now_timestamp_string());
+                });
+            }
+            Ok(Err(err)) => {
+                let app_state = app_handle.state::<AppState>();
+                update_watcher_status(app_state.inner(), |status| {
+                    status.last_error = Some(format!("Evento watcher inválido: {err}"));
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if pending_events
+                    && last_event_time
+                        .map(|value| value.elapsed() >= Duration::from_millis(debounce_ms))
+                        .unwrap_or(false)
+                {
+                    pending_events = false;
+                    last_event_time = None;
+
+                    let app_state = app_handle.state::<AppState>();
+                    update_watcher_status(app_state.inner(), |status| {
+                        status.pending_events = false;
+                    });
+
+                    let settings = app_state
+                        .index_settings
+                        .lock()
+                        .map(|value| value.clone())
+                        .unwrap_or_else(|_| default_indexing_settings());
+
+                    if let Err(err) = execute_indexing(&app_handle, app_state.inner(), settings, "watcher") {
+                        update_watcher_status(app_state.inner(), |status| {
+                            status.last_error = Some(err.clone());
+                        });
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let app_state = app_handle.state::<AppState>();
+    update_watcher_status(app_state.inner(), |status| {
+        status.running = false;
+        status.pending_events = false;
+    });
+}
+
+fn is_relevant_watch_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
     )
 }
 
@@ -811,6 +1361,401 @@ fn build_index_snippet(item: &IndexedFileItem, query_tokens: &[String]) -> Strin
     "Coincidencia por nombre desde índice local (más rápido).".to_string()
 }
 
+fn semantic_db_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("semantic-chunks.db");
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    Some(path)
+}
+
+fn open_semantic_connection(app: &tauri::AppHandle) -> Result<Connection, String> {
+    let path = semantic_db_path(app).ok_or_else(|| "No se pudo resolver ruta de BDD".to_string())?;
+    let conn = Connection::open(path).map_err(|err| format!("No se pudo abrir la BDD local: {err}"))?;
+    ensure_semantic_schema(&conn)?;
+    Ok(conn)
+}
+
+fn ensure_semantic_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS chunks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          path TEXT NOT NULL,
+          title TEXT NOT NULL,
+          chunk_index INTEGER NOT NULL,
+          chunk_text TEXT NOT NULL,
+          search_key TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          modified_unix_secs INTEGER NOT NULL,
+          updated_unix_secs INTEGER NOT NULL,
+          UNIQUE(path, chunk_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chunks_search_key ON chunks(search_key);
+        CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
+        ",
+    )
+    .map_err(|err| format!("No se pudo preparar schema de chunks: {err}"))
+}
+
+fn rebuild_chunk_db(app: &tauri::AppHandle, items: &[IndexedFileItem]) -> Result<(), String> {
+    let mut conn = open_semantic_connection(app)?;
+    let tx = conn
+        .transaction()
+        .map_err(|err| format!("No se pudo abrir transacción de chunks: {err}"))?;
+
+    tx.execute("DELETE FROM chunks", [])
+        .map_err(|err| format!("No se pudo limpiar chunks previos: {err}"))?;
+
+    let now_unix = now_timestamp_string().parse::<u64>().unwrap_or_default();
+
+    for item in items {
+        let source_text = item
+            .content_excerpt
+            .as_ref()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| item.title.clone());
+
+        let mut chunks = split_text_chunks(&source_text, 900, 180);
+        if chunks.is_empty() {
+            chunks.push(item.title.clone());
+        }
+
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let lowered_chunk = chunk.to_lowercase();
+            let search_key = format!("{} {}", item.title.to_lowercase(), lowered_chunk);
+
+            tx.execute(
+                "INSERT INTO chunks (path, title, chunk_index, chunk_text, search_key, size_bytes, modified_unix_secs, updated_unix_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    item.path,
+                    item.title,
+                    index as i64,
+                    chunk,
+                    search_key,
+                    item.size_bytes as i64,
+                    item.modified_unix_secs as i64,
+                    now_unix as i64
+                ],
+            )
+            .map_err(|err| format!("No se pudo insertar chunk en BDD: {err}"))?;
+        }
+    }
+
+    tx.commit()
+        .map_err(|err| format!("No se pudo cerrar transacción de chunks: {err}"))
+}
+
+fn split_text_chunks(content: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+    let chars = content.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let safe_overlap = overlap.min(chunk_size.saturating_sub(1));
+
+    while start < chars.len() {
+        let end = (start + chunk_size).min(chars.len());
+        let chunk = chars[start..end].iter().collect::<String>();
+        let normalized = normalize_text_for_index(&chunk, chunk_size + 200);
+
+        if !normalized.is_empty() {
+            chunks.push(normalized);
+        }
+
+        if end == chars.len() {
+            break;
+        }
+
+        start = end.saturating_sub(safe_overlap);
+    }
+
+    chunks
+}
+
+fn search_in_chunk_db(
+    app: &tauri::AppHandle,
+    query: &str,
+    roots: &[PathBuf],
+    excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
+    max_results: usize,
+) -> Result<Vec<SearchResultItem>, String> {
+    let candidates = load_chunk_candidates(
+        app,
+        query,
+        roots,
+        excluded_extensions,
+        excluded_folders,
+        max_file_size_bytes,
+        max_results,
+    )?;
+
+    Ok(candidates
+        .into_iter()
+        .take(max_results)
+        .map(|item| SearchResultItem {
+            title: item.title,
+            path: item.path,
+            snippet: build_chunk_snippet(&item.chunk_text, query),
+        })
+        .collect())
+}
+
+fn load_chunk_candidates(
+    app: &tauri::AppHandle,
+    query: &str,
+    roots: &[PathBuf],
+    excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
+    max_results: usize,
+) -> Result<Vec<ChunkCandidate>, String> {
+    let tokens = tokenize_query(query);
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = open_semantic_connection(app)?;
+    let mut sql = String::from(
+        "SELECT title, path, chunk_text, search_key, size_bytes FROM chunks",
+    );
+
+    let clauses = tokens
+        .iter()
+        .map(|_| "search_key LIKE ?")
+        .collect::<Vec<_>>();
+
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" OR "));
+    }
+
+    sql.push_str(" ORDER BY updated_unix_secs DESC LIMIT ?");
+
+    let mut params_vec = tokens
+        .iter()
+        .map(|token| format!("%{}%", token))
+        .collect::<Vec<String>>();
+    params_vec.push((max_results.saturating_mul(12).max(80)).to_string());
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| format!("No se pudo preparar consulta de chunks: {err}"))?;
+
+    let rows = stmt
+        .query_map(params_from_iter(params_vec.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|err| format!("No se pudo ejecutar consulta de chunks: {err}"))?;
+
+    let lowered_query = query.to_lowercase();
+    let mut by_path = HashMap::<String, ChunkCandidate>::new();
+
+    for row in rows.flatten() {
+        let (title, path, chunk_text, search_key, size_bytes_raw) = row;
+        let size_bytes = size_bytes_raw.max(0) as u64;
+
+        if size_bytes > max_file_size_bytes {
+            continue;
+        }
+
+        let path_buf = PathBuf::from(&path);
+        if !matches_roots(&path_buf, roots)
+            || should_skip_custom_dir(&path_buf, excluded_folders)
+            || is_excluded_file(&path_buf, excluded_extensions)
+        {
+            continue;
+        }
+
+        let mut hits = 0f32;
+        for token in &tokens {
+            if search_key.contains(token) {
+                hits += 1.0;
+            }
+        }
+
+        if lowered_query.len() > 2 && search_key.contains(&lowered_query) {
+            hits += 0.75;
+        }
+
+        if hits <= 0.0 {
+            continue;
+        }
+
+        let lexical_score = (hits / tokens.len() as f32).min(1.6);
+        let current = by_path.get(&path).map(|value| value.lexical_score).unwrap_or(-1.0);
+
+        if lexical_score > current {
+            by_path.insert(
+                path.clone(),
+                ChunkCandidate {
+                    title,
+                    path,
+                    chunk_text,
+                    lexical_score,
+                },
+            );
+        }
+    }
+
+    let mut values = by_path.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| right.lexical_score.total_cmp(&left.lexical_score));
+    values.truncate(max_results.max(1));
+    Ok(values)
+}
+
+fn build_chunk_snippet(content: &str, query: &str) -> String {
+    if content.is_empty() {
+        return "Coincidencia semántica/lexical en chunk indexado.".to_string();
+    }
+
+    let lowered_content = content.to_lowercase();
+    let tokens = tokenize_query(query);
+
+    let position = tokens
+        .iter()
+        .filter_map(|token| lowered_content.find(token))
+        .min()
+        .unwrap_or(0);
+
+    let start_char = lowered_content[..position].chars().count().saturating_sub(60);
+    let snippet = content
+        .chars()
+        .skip(start_char)
+        .take(220)
+        .collect::<String>();
+
+    format!("Coincidencia en chunk: {}", snippet)
+}
+
+fn ai_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("ai-config.json");
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    Some(path)
+}
+
+fn save_ai_provider_config(app: &tauri::AppHandle, config: &AiProviderConfig) -> Result<(), String> {
+    let path = ai_config_path(app).ok_or_else(|| "No se pudo resolver ruta de config IA".to_string())?;
+    let serialized = serde_json::to_string(config)
+        .map_err(|err| format!("No se pudo serializar config IA: {err}"))?;
+    fs::write(path, serialized).map_err(|err| format!("No se pudo guardar config IA: {err}"))
+}
+
+fn load_ai_provider_config(app: &tauri::AppHandle) -> Option<AiProviderConfig> {
+    let path = ai_config_path(app)?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<AiProviderConfig>(&content).ok()
+}
+
+fn ai_provider_status_from_config(config: Option<&AiProviderConfig>) -> AiProviderStatus {
+    if let Some(cfg) = config {
+        return AiProviderStatus {
+            configured: true,
+            provider: cfg.provider.clone(),
+            base_url: cfg.base_url.clone(),
+            embedding_model: cfg.embedding_model.clone(),
+            api_key_hint: Some(mask_api_key(&cfg.api_key)),
+        };
+    }
+
+    AiProviderStatus {
+        configured: false,
+        provider: "openrouter-compatible".to_string(),
+        base_url: "https://openrouter.ai/api/v1/embeddings".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
+        api_key_hint: None,
+    }
+}
+
+fn mask_api_key(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= 8 {
+        return "********".to_string();
+    }
+
+    let prefix = chars.iter().take(4).collect::<String>();
+    let suffix = chars.iter().skip(chars.len() - 4).collect::<String>();
+    format!("{}...{}", prefix, suffix)
+}
+
+async fn request_embeddings(config: &AiProviderConfig, input: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    let payload = serde_json::json!({
+        "model": config.embedding_model,
+        "input": input,
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&config.base_url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("No se pudo llamar API de embeddings: {err}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Embeddings respondieron {}: {}",
+            status.as_u16(),
+            body.chars().take(220).collect::<String>()
+        ));
+    }
+
+    let parsed = response
+        .json::<EmbeddingResponse>()
+        .await
+        .map_err(|err| format!("Respuesta de embeddings inválida: {err}"))?;
+
+    Ok(parsed
+        .data
+        .into_iter()
+        .map(|item| item.embedding)
+        .collect())
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    if left.is_empty() || right.is_empty() || left.len() != right.len() {
+        return 0.0;
+    }
+
+    let mut dot = 0.0f32;
+    let mut left_norm = 0.0f32;
+    let mut right_norm = 0.0f32;
+
+    for (a, b) in left.iter().zip(right.iter()) {
+        dot += a * b;
+        left_norm += a * a;
+        right_norm += b * b;
+    }
+
+    if left_norm <= 0.0 || right_norm <= 0.0 {
+        return 0.0;
+    }
+
+    dot / (left_norm.sqrt() * right_norm.sqrt())
+}
+
 fn tokenize_query(query: &str) -> Vec<String> {
     query
         .to_lowercase()
@@ -996,8 +1941,20 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if let Some(snapshot) = load_index_snapshot(app.handle()) {
+                let snapshot_roots = snapshot.roots.clone();
+
                 if let Ok(mut guard) = app.state::<AppState>().index.lock() {
                     *guard = Some(snapshot);
+                }
+
+                if let Ok(mut settings) = app.state::<AppState>().index_settings.lock() {
+                    settings.roots = snapshot_roots;
+                }
+            }
+
+            if let Some(ai_config) = load_ai_provider_config(app.handle()) {
+                if let Ok(mut guard) = app.state::<AppState>().ai_config.lock() {
+                    *guard = Some(ai_config);
                 }
             }
 
@@ -1007,10 +1964,16 @@ pub fn run() {
             greet,
             open_file,
             search_stub,
+            semantic_search,
             start_indexing,
             get_index_status,
             get_index_diagnostics,
-            cancel_indexing
+            cancel_indexing,
+            start_file_watcher,
+            stop_file_watcher,
+            get_file_watcher_status,
+            configure_ai_provider,
+            get_ai_provider_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
