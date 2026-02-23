@@ -27,4 +27,8 @@ pdf-extract = "0.7"
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 notify = "6"
+lancedb = "0.10"
+arrow-array = "52.2"
+arrow-schema = "52.2"
+lopdf = "0.35"
 

@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use lancedb::connect;
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
 use rusqlite::{params, params_from_iter, Connection};
 use tauri::{Emitter, Manager, State};
@@ -87,6 +90,8 @@ struct IndexDiagnostics {
     last_error: Option<String>,
     updated_at: Option<String>,
     canceled: bool,
+    lancedb_synced: bool,
+    pdf_fallback_used: usize,
 }
 
 struct BuildIndexOutcome {
@@ -97,6 +102,7 @@ struct BuildIndexOutcome {
     pdf_failed: usize,
     pdf_failed_examples: Vec<String>,
     canceled: bool,
+    pdf_fallback_used: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -609,6 +615,8 @@ fn execute_indexing(
             },
             updated_at: Some(now_timestamp_string()),
             canceled: build_outcome.canceled,
+            lancedb_synced: false,
+            pdf_fallback_used: build_outcome.pdf_fallback_used,
         };
 
         if let Ok(mut guard) = state.diagnostics.lock() {
@@ -633,6 +641,26 @@ fn execute_indexing(
                 if let Some(current) = guard.as_mut() {
                     current.last_error = Some(format!("Indexado hecho, pero BDD de chunks falló: {err}"));
                     current.updated_at = Some(now_timestamp_string());
+                }
+            }
+        }
+
+        match rebuild_lancedb_index(app, &snapshot.files) {
+            Ok(()) => {
+                if let Ok(mut guard) = state.diagnostics.lock() {
+                    if let Some(current) = guard.as_mut() {
+                        current.lancedb_synced = true;
+                    }
+                }
+            }
+            Err(err) => {
+                if let Ok(mut guard) = state.diagnostics.lock() {
+                    if let Some(current) = guard.as_mut() {
+                        current.last_error = Some(format!(
+                            "Indexado listo, SQLite OK pero LanceDB falló: {err}"
+                        ));
+                        current.lancedb_synced = false;
+                    }
                 }
             }
         }
@@ -1027,6 +1055,7 @@ fn build_index_files(
     let mut pdf_scanned = 0usize;
     let mut pdf_indexed = 0usize;
     let mut pdf_failed = 0usize;
+    let mut pdf_fallback_used = 0usize;
     let mut pdf_failed_examples: Vec<String> = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = roots
         .iter()
@@ -1062,6 +1091,7 @@ fn build_index_files(
                 pdf_failed,
                 pdf_failed_examples,
                 canceled: true,
+                pdf_fallback_used,
             };
         }
 
@@ -1097,6 +1127,7 @@ fn build_index_files(
                     pdf_failed,
                     pdf_failed_examples,
                     canceled: true,
+                    pdf_fallback_used,
                 };
             }
 
@@ -1179,7 +1210,11 @@ fn build_index_files(
 
             let content_excerpt = if is_pdf {
                 match extract_pdf_text(&path) {
-                    Some(text) => {
+                    Some((text, used_fallback)) => {
+                        if used_fallback {
+                            pdf_fallback_used += 1;
+                        }
+
                         let normalized = normalize_text_for_index(&text, 120_000);
                         if normalized.is_empty() {
                             pdf_failed += 1;
@@ -1255,6 +1290,7 @@ fn build_index_files(
         pdf_failed,
         pdf_failed_examples,
         canceled: false,
+        pdf_fallback_used,
     }
 }
 
@@ -1315,15 +1351,49 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
     }
 }
 
-fn extract_pdf_text(path: &Path) -> Option<String> {
-    let extracted = std::panic::catch_unwind(|| pdf_extract::extract_text(path))
-        .ok()?
-        .ok()?;
+fn extract_pdf_text(path: &Path) -> Option<(String, bool)> {
+    let primary = std::panic::catch_unwind(|| pdf_extract::extract_text(path))
+        .ok()
+        .and_then(|result| result.ok())
+        .filter(|text| !text.trim().is_empty());
 
-    if extracted.trim().is_empty() {
+    if let Some(text) = primary {
+        return Some((text, false));
+    }
+
+    extract_pdf_text_lopdf(path).map(|text| (text, true))
+}
+
+fn extract_pdf_text_lopdf(path: &Path) -> Option<String> {
+    let document = lopdf::Document::load(path).ok()?;
+    let pages = document.get_pages();
+    if pages.is_empty() {
+        return None;
+    }
+
+    let mut combined = String::new();
+    let mut page_numbers = pages.keys().copied().collect::<Vec<u32>>();
+    page_numbers.sort_unstable();
+
+    for chunk in page_numbers.chunks(12) {
+        let chunk_vec = chunk.to_vec();
+        if let Ok(text) = document.extract_text(&chunk_vec) {
+            if !text.trim().is_empty() {
+                combined.push_str(&text);
+                combined.push('\n');
+            }
+        }
+
+        if combined.len() > 450_000 {
+            break;
+        }
+    }
+
+    let trimmed = combined.trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(extracted)
+        Some(trimmed.to_string())
     }
 }
 
@@ -1369,6 +1439,100 @@ fn semantic_db_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     }
 
     Some(path)
+}
+
+fn lancedb_dir_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("semantic-lancedb");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::create_dir_all(&path);
+    Some(path)
+}
+
+fn rebuild_lancedb_index(app: &tauri::AppHandle, items: &[IndexedFileItem]) -> Result<(), String> {
+    tauri::async_runtime::block_on(rebuild_lancedb_index_async(app, items))
+}
+
+async fn rebuild_lancedb_index_async(app: &tauri::AppHandle, items: &[IndexedFileItem]) -> Result<(), String> {
+    let db_path = lancedb_dir_path(app).ok_or_else(|| "No se pudo resolver path de LanceDB".to_string())?;
+    let uri = db_path.to_string_lossy().to_string();
+
+    let db = connect(&uri)
+        .execute()
+        .await
+        .map_err(|err| format!("No se pudo conectar LanceDB: {err}"))?;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("path", DataType::Utf8, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("chunk_index", DataType::Int64, false),
+        Field::new("chunk_text", DataType::Utf8, false),
+        Field::new("search_key", DataType::Utf8, false),
+        Field::new("size_bytes", DataType::Int64, false),
+        Field::new("modified_unix_secs", DataType::Int64, false),
+        Field::new("updated_unix_secs", DataType::Int64, false),
+    ]));
+
+    let mut paths = Vec::<String>::new();
+    let mut titles = Vec::<String>::new();
+    let mut chunk_indexes = Vec::<i64>::new();
+    let mut chunk_texts = Vec::<String>::new();
+    let mut search_keys = Vec::<String>::new();
+    let mut sizes = Vec::<i64>::new();
+    let mut modified = Vec::<i64>::new();
+    let mut updated = Vec::<i64>::new();
+    let now_unix = now_timestamp_string().parse::<i64>().unwrap_or_default();
+
+    for item in items {
+        let source_text = item
+            .content_excerpt
+            .as_ref()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| item.title.clone());
+
+        let mut chunks = split_text_chunks(&source_text, 900, 180);
+        if chunks.is_empty() {
+            chunks.push(item.title.clone());
+        }
+
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            paths.push(item.path.clone());
+            titles.push(item.title.clone());
+            chunk_indexes.push(index as i64);
+            search_keys.push(format!("{} {}", item.title.to_lowercase(), chunk.to_lowercase()));
+            chunk_texts.push(chunk);
+            sizes.push(item.size_bytes as i64);
+            modified.push(item.modified_unix_secs as i64);
+            updated.push(now_unix);
+        }
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(paths)),
+            Arc::new(StringArray::from(titles)),
+            Arc::new(Int64Array::from(chunk_indexes)),
+            Arc::new(StringArray::from(chunk_texts)),
+            Arc::new(StringArray::from(search_keys)),
+            Arc::new(Int64Array::from(sizes)),
+            Arc::new(Int64Array::from(modified)),
+            Arc::new(Int64Array::from(updated)),
+        ],
+    )
+    .map_err(|err| format!("No se pudo construir batch Arrow para LanceDB: {err}"))?;
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+
+    let _ = db.drop_table("chunks").await;
+
+    db.create_table("chunks", Box::new(reader))
+        .execute()
+        .await
+        .map_err(|err| format!("No se pudo crear tabla chunks en LanceDB: {err}"))?;
+
+    Ok(())
 }
 
 fn open_semantic_connection(app: &tauri::AppHandle) -> Result<Connection, String> {

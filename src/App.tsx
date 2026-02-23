@@ -41,6 +41,8 @@ type IndexDiagnostics = {
   last_error: string | null;
   updated_at: string | null;
   canceled: boolean;
+  lancedb_synced: boolean;
+  pdf_fallback_used: number;
 };
 
 type AiProviderStatus = {
@@ -666,6 +668,14 @@ function App() {
                       PDFs sin texto extraíble: {indexDiagnostics.pdf_failed.toLocaleString()}
                     </p>
                   )}
+                  {indexDiagnostics.pdf_fallback_used > 0 && (
+                    <p className="mt-1 text-[11px] text-sky-300">
+                      PDFs recuperados por fallback avanzado: {indexDiagnostics.pdf_fallback_used.toLocaleString()}
+                    </p>
+                  )}
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    LanceDB sync: {indexDiagnostics.lancedb_synced ? "OK" : "pendiente/fallback SQLite"}
+                  </p>
                   {indexDiagnostics.last_error && (
                     <p className="mt-1 text-[11px] text-red-300">{indexDiagnostics.last_error}</p>
                   )}
