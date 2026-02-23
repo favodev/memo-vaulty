@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -85,6 +85,7 @@ function App() {
   const [isSavingAi, setIsSavingAi] = useState(false);
   const [watcherStatus, setWatcherStatus] = useState<FileWatcherStatus | null>(null);
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
+  const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -254,9 +255,11 @@ function App() {
 
       setResults(response);
       setSelectedIndex(response.length > 0 ? 0 : -1);
+      setQuickLookPath(response.length > 0 ? response[0].path : null);
     } catch {
       setResults([]);
       setSelectedIndex(-1);
+      setQuickLookPath(null);
       setErrorMessage("No se pudo ejecutar la búsqueda local.");
     } finally {
       setIsLoading(false);
@@ -491,6 +494,33 @@ function App() {
 
   const visibleRoots = (indexStatus?.roots.length ? indexStatus.roots : searchRoots).slice(0, 4);
   const hasMoreRoots = (indexStatus?.roots.length ? indexStatus.roots.length : searchRoots.length) > visibleRoots.length;
+  const quickLookItem = quickLookPath ? results.find((item) => item.path === quickLookPath) ?? null : null;
+
+  const quickLookExt = useMemo(() => {
+    if (!quickLookItem?.path) {
+      return "";
+    }
+
+    const lower = quickLookItem.path.toLowerCase();
+    const dot = lower.lastIndexOf(".");
+    if (dot < 0) {
+      return "";
+    }
+
+    return lower.slice(dot + 1);
+  }, [quickLookItem?.path]);
+
+  const quickLookUrl = useMemo(() => {
+    if (!quickLookItem?.path) {
+      return null;
+    }
+
+    try {
+      return convertFileSrc(quickLookItem.path);
+    } catch {
+      return null;
+    }
+  }, [quickLookItem?.path]);
 
   return (
     <div
@@ -693,13 +723,21 @@ function App() {
             onKeyDown={(e) => {
               if (e.key === "ArrowDown" && results.length > 0) {
                 e.preventDefault();
-                setSelectedIndex((prev) => Math.min(prev + 1, results.length - 1));
+                setSelectedIndex((prev) => {
+                  const next = Math.min(prev + 1, results.length - 1);
+                  setQuickLookPath(results[next]?.path ?? null);
+                  return next;
+                });
                 return;
               }
 
               if (e.key === "ArrowUp" && results.length > 0) {
                 e.preventDefault();
-                setSelectedIndex((prev) => Math.max(prev - 1, 0));
+                setSelectedIndex((prev) => {
+                  const next = Math.max(prev - 1, 0);
+                  setQuickLookPath(results[next]?.path ?? null);
+                  return next;
+                });
                 return;
               }
 
@@ -719,6 +757,7 @@ function App() {
                 setHasSearched(false);
                 setErrorMessage(null);
                 setSelectedIndex(-1);
+                setQuickLookPath(null);
               }
             }}
             autoFocus
@@ -738,43 +777,83 @@ function App() {
         )}
 
         {!isLoading && results.length > 0 && (
-          <div className="mt-5 max-h-[62vh] space-y-2 overflow-y-auto pr-1 pb-2">
-            {results.map((item, index) => (
-              <div
-                key={item.path}
-                className={`rounded-lg px-4 py-3 transition-colors ${
-                  selectedIndex === index ? "bg-white/10" : "bg-white/4"
-                }`}
-                onMouseEnter={() => setSelectedIndex(index)}
-                onDoubleClick={() => {
-                  void openFile(item.path);
-                }}
-              >
-                <p className="text-sm font-medium text-white">{renderHighlighted(item.title)}</p>
-                <p className="mt-1 text-xs text-gray-400">{renderHighlighted(item.snippet)}</p>
-                <p className="mt-1 text-[11px] text-gray-500 truncate">{item.path}</p>
-                <div className="mt-2 flex items-center gap-2">
-                  <button
-                    type="button"
-                    className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
-                    onClick={() => {
-                      void openFile(item.path);
-                    }}
-                  >
-                    Abrir
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded-md bg-white/5 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:bg-white/15"
-                    onClick={() => {
-                      void openContainingFolder(item.path);
-                    }}
-                  >
-                    Carpeta
-                  </button>
+          <div className="mt-5 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(280px,360px)]">
+            <div className="max-h-[62vh] space-y-2 overflow-y-auto pr-1 pb-2">
+              {results.map((item, index) => (
+                <div
+                  key={item.path}
+                  className={`rounded-lg px-4 py-3 transition-colors ${
+                    selectedIndex === index ? "bg-white/10" : "bg-white/4"
+                  }`}
+                  onMouseEnter={() => {
+                    setSelectedIndex(index);
+                    setQuickLookPath(item.path);
+                  }}
+                  onClick={() => {
+                    setSelectedIndex(index);
+                    setQuickLookPath(item.path);
+                  }}
+                  onDoubleClick={() => {
+                    void openFile(item.path);
+                  }}
+                >
+                  <p className="text-sm font-medium text-white">{renderHighlighted(item.title)}</p>
+                  <p className="mt-1 text-xs text-gray-400">{renderHighlighted(item.snippet)}</p>
+                  <p className="mt-1 text-[11px] text-gray-500 truncate">{item.path}</p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
+                      onClick={() => {
+                        void openFile(item.path);
+                      }}
+                    >
+                      Abrir
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/5 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:bg-white/15"
+                      onClick={() => {
+                        void openContainingFolder(item.path);
+                      }}
+                    >
+                      Carpeta
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
+
+            <div className="max-h-[62vh] overflow-hidden rounded-lg bg-white/4 p-3 ring-1 ring-white/10">
+              <p className="text-[11px] uppercase tracking-wide text-gray-500">Quick Look</p>
+
+              {!quickLookItem && (
+                <p className="mt-2 text-xs text-gray-500">Selecciona un resultado para previsualizar.</p>
+              )}
+
+              {quickLookItem && (
+                <>
+                  <p className="mt-2 truncate text-xs text-gray-300">{quickLookItem.title}</p>
+                  <p className="truncate text-[10px] text-gray-500">{quickLookItem.path}</p>
+
+                  <div className="mt-3 h-[46vh] overflow-hidden rounded-md bg-black/30 ring-1 ring-white/10">
+                    {(quickLookExt === "png" || quickLookExt === "jpg" || quickLookExt === "jpeg" || quickLookExt === "webp" || quickLookExt === "gif") && quickLookUrl && (
+                      <img src={quickLookUrl} alt={quickLookItem.title} className="h-full w-full object-contain" loading="lazy" />
+                    )}
+
+                    {quickLookExt === "pdf" && quickLookUrl && (
+                      <iframe title={`quicklook-${quickLookItem.path}`} src={quickLookUrl} className="h-full w-full border-0" />
+                    )}
+
+                    {quickLookExt !== "pdf" && quickLookExt !== "png" && quickLookExt !== "jpg" && quickLookExt !== "jpeg" && quickLookExt !== "webp" && quickLookExt !== "gif" && (
+                      <div className="flex h-full items-center justify-center px-3 text-center">
+                        <p className="text-xs text-gray-500">Vista previa visual disponible para PDF e imágenes. Para otros tipos, usa el snippet y el botón Abrir.</p>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         )}
 
