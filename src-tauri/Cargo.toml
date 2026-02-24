@@ -31,4 +31,5 @@ lancedb = "0.10"
 arrow-array = "52.2"
 arrow-schema = "52.2"
 lopdf = "0.35"
+futures = "0.3"
 

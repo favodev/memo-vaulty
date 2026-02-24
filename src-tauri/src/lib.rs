@@ -7,9 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
 use lancedb::connect;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
 use rusqlite::{params, params_from_iter, Connection};
 use tauri::{Emitter, Manager, State};
@@ -370,7 +372,7 @@ async fn semantic_search(
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
 
-    let mut candidates = load_chunk_candidates(
+    let mut candidates = match load_chunk_candidates_from_lancedb(
         &app,
         clean_query,
         &search_roots,
@@ -378,7 +380,20 @@ async fn semantic_search(
         &folder_exclusions,
         max_file_size_bytes,
         80,
-    )?;
+    )
+    .await
+    {
+        Ok(value) if !value.is_empty() => value,
+        _ => load_chunk_candidates(
+            &app,
+            clean_query,
+            &search_roots,
+            &exclusions,
+            &folder_exclusions,
+            max_file_size_bytes,
+            80,
+        )?,
+    };
 
     if candidates.is_empty() {
         return Ok(Vec::new());
@@ -1773,6 +1788,147 @@ fn load_chunk_candidates(
                     lexical_score,
                 },
             );
+        }
+    }
+
+    let mut values = by_path.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| right.lexical_score.total_cmp(&left.lexical_score));
+    values.truncate(max_results.max(1));
+    Ok(values)
+}
+
+async fn load_chunk_candidates_from_lancedb(
+    app: &tauri::AppHandle,
+    query: &str,
+    roots: &[PathBuf],
+    excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
+    max_results: usize,
+) -> Result<Vec<ChunkCandidate>, String> {
+    let tokens = tokenize_query(query);
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let db_path = lancedb_dir_path(app).ok_or_else(|| "No se pudo resolver path de LanceDB".to_string())?;
+    let uri = db_path.to_string_lossy().to_string();
+
+    let db = connect(&uri)
+        .execute()
+        .await
+        .map_err(|err| format!("No se pudo conectar LanceDB para buscar: {err}"))?;
+
+    let table = match db.open_table("chunks").execute().await {
+        Ok(value) => value,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let where_clause = tokens
+        .iter()
+        .map(|token| format!("search_key LIKE '%{}%'", token.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let mut query_builder = table
+        .query()
+        .limit(max_results.saturating_mul(14).max(120));
+
+    if !where_clause.is_empty() {
+        query_builder = query_builder.only_if(where_clause);
+    }
+
+    let mut stream = query_builder
+        .execute()
+        .await
+        .map_err(|err| format!("No se pudo ejecutar query LanceDB: {err}"))?;
+
+    let lowered_query = query.to_lowercase();
+    let mut by_path = HashMap::<String, ChunkCandidate>::new();
+
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|err| format!("No se pudo leer stream de LanceDB: {err}"))?
+    {
+        let title_col = batch
+            .column_by_name("title")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| "LanceDB: columna title inválida".to_string())?;
+        let path_col = batch
+            .column_by_name("path")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| "LanceDB: columna path inválida".to_string())?;
+        let chunk_text_col = batch
+            .column_by_name("chunk_text")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| "LanceDB: columna chunk_text inválida".to_string())?;
+        let search_key_col = batch
+            .column_by_name("search_key")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| "LanceDB: columna search_key inválida".to_string())?;
+        let size_col = batch
+            .column_by_name("size_bytes")
+            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| "LanceDB: columna size_bytes inválida".to_string())?;
+
+        for row in 0..batch.num_rows() {
+            if title_col.is_null(row)
+                || path_col.is_null(row)
+                || chunk_text_col.is_null(row)
+                || search_key_col.is_null(row)
+                || size_col.is_null(row)
+            {
+                continue;
+            }
+
+            let title = title_col.value(row).to_string();
+            let path = path_col.value(row).to_string();
+            let chunk_text = chunk_text_col.value(row).to_string();
+            let search_key = search_key_col.value(row).to_string();
+            let size_bytes = size_col.value(row).max(0) as u64;
+
+            if size_bytes > max_file_size_bytes {
+                continue;
+            }
+
+            let path_buf = PathBuf::from(&path);
+            if !matches_roots(&path_buf, roots)
+                || should_skip_custom_dir(&path_buf, excluded_folders)
+                || is_excluded_file(&path_buf, excluded_extensions)
+            {
+                continue;
+            }
+
+            let mut hits = 0f32;
+            for token in &tokens {
+                if search_key.contains(token) {
+                    hits += 1.0;
+                }
+            }
+
+            if lowered_query.len() > 2 && search_key.contains(&lowered_query) {
+                hits += 0.75;
+            }
+
+            if hits <= 0.0 {
+                continue;
+            }
+
+            let lexical_score = (hits / tokens.len() as f32).min(1.6);
+            let current = by_path.get(&path).map(|value| value.lexical_score).unwrap_or(-1.0);
+
+            if lexical_score > current {
+                by_path.insert(
+                    path.clone(),
+                    ChunkCandidate {
+                        title,
+                        path,
+                        chunk_text,
+                        lexical_score,
+                    },
+                );
+            }
         }
     }
 
