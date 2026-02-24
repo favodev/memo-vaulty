@@ -60,6 +60,13 @@ struct ImageMetadata {
     orientation: Option<String>,
 }
 
+#[derive(Serialize)]
+struct FileTextPreview {
+    available: bool,
+    source: String,
+    text: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct IndexedFileItem {
     title: String,
@@ -83,6 +90,62 @@ fn get_image_metadata(path: String) -> Result<ImageMetadata, String> {
     }
 
     Ok(read_image_metadata(&image_path))
+}
+
+#[tauri::command]
+fn get_file_text_preview(path: String, max_chars: Option<usize>) -> Result<FileTextPreview, String> {
+    let file_path = PathBuf::from(&path);
+    if !file_path.exists() {
+        return Err("El archivo no existe".to_string());
+    }
+
+    let limit = max_chars.unwrap_or(14_000).clamp(500, 80_000);
+
+    let extension = file_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+
+    if extension == "pdf" {
+        if let Some((text, used_fallback)) = extract_pdf_text(&file_path) {
+            let normalized = normalize_text_for_index(&text, limit);
+            return Ok(FileTextPreview {
+                available: !normalized.is_empty(),
+                source: if used_fallback {
+                    "pdf-fallback".to_string()
+                } else {
+                    "pdf-extract".to_string()
+                },
+                text: normalized,
+            });
+        }
+
+        return Ok(FileTextPreview {
+            available: false,
+            source: "pdf".to_string(),
+            text: "No se pudo extraer texto de este PDF.".to_string(),
+        });
+    }
+
+    if extension == "txt" || extension == "md" {
+        let bytes = fs::read(&file_path).map_err(|err| format!("No se pudo leer archivo: {err}"))?;
+        let slice = &bytes[..bytes.len().min(limit.saturating_mul(2))];
+        let text = String::from_utf8_lossy(slice);
+        let normalized = normalize_text_for_index(&text, limit);
+
+        return Ok(FileTextPreview {
+            available: !normalized.is_empty(),
+            source: "text-file".to_string(),
+            text: normalized,
+        });
+    }
+
+    Ok(FileTextPreview {
+        available: false,
+        source: "unsupported".to_string(),
+        text: "Vista textual no disponible para este tipo de archivo.".to_string(),
+    })
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2396,6 +2459,7 @@ pub fn run() {
             greet,
             open_file,
             get_image_metadata,
+            get_file_text_preview,
             search_stub,
             semantic_search,
             start_indexing,

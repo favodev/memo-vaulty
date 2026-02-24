@@ -72,6 +72,12 @@ type ImageMetadata = {
   orientation: string | null;
 };
 
+type FileTextPreview = {
+  available: boolean;
+  source: string;
+  text: string;
+};
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -99,6 +105,8 @@ function App() {
   const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
   const [quickLookImageMeta, setQuickLookImageMeta] = useState<ImageMetadata | null>(null);
   const [isQuickLookOpen, setIsQuickLookOpen] = useState(false);
+  const [quickLookTextPreview, setQuickLookTextPreview] = useState<FileTextPreview | null>(null);
+  const [quickLookMode, setQuickLookMode] = useState<"visual" | "text">("visual");
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -536,6 +544,7 @@ function App() {
   }, [quickLookItem?.path]);
 
   const isQuickLookImage = quickLookExt === "png" || quickLookExt === "jpg" || quickLookExt === "jpeg" || quickLookExt === "webp" || quickLookExt === "gif" || quickLookExt === "bmp" || quickLookExt === "tiff";
+  const hasVisualPreview = isQuickLookImage || quickLookExt === "pdf";
 
   useEffect(() => {
     if (!quickLookItem?.path || !isQuickLookImage) {
@@ -561,6 +570,34 @@ function App() {
       cancelled = true;
     };
   }, [quickLookItem?.path, isQuickLookImage]);
+
+  useEffect(() => {
+    if (!quickLookItem?.path || !isQuickLookOpen) {
+      setQuickLookTextPreview(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    void invoke<FileTextPreview>("get_file_text_preview", {
+      path: quickLookItem.path,
+      maxChars: 14000,
+    })
+      .then((preview) => {
+        if (!cancelled) {
+          setQuickLookTextPreview(preview);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setQuickLookTextPreview(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [quickLookItem?.path, isQuickLookOpen]);
 
   return (
     <div
@@ -874,6 +911,10 @@ function App() {
                     className="inline-flex items-center gap-1 rounded-md bg-white/5 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:bg-white/15"
                     onClick={() => {
                       setQuickLookPath(item.path);
+                      const lower = item.path.toLowerCase();
+                      const ext = lower.includes(".") ? lower.slice(lower.lastIndexOf(".") + 1) : "";
+                      const visual = ["pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff"].includes(ext);
+                      setQuickLookMode(visual ? "visual" : "text");
                       setIsQuickLookOpen(true);
                     }}
                   >
@@ -1136,27 +1177,64 @@ function App() {
                     </p>
                   )}
                 </div>
-                <button
-                  type="button"
-                  className="rounded-md bg-white/10 px-2 py-1 text-xs text-gray-200 hover:bg-white/20"
-                  onClick={() => setIsQuickLookOpen(false)}
-                >
-                  Cerrar
-                </button>
+                <div className="flex items-center gap-2">
+                  {hasVisualPreview && (
+                    <button
+                      type="button"
+                      className={`rounded-md px-2 py-1 text-xs transition-colors ${
+                        quickLookMode === "visual" ? "bg-blue-500/70 text-white" : "bg-white/10 text-gray-200 hover:bg-white/20"
+                      }`}
+                      onClick={() => setQuickLookMode("visual")}
+                    >
+                      Visual
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className={`rounded-md px-2 py-1 text-xs transition-colors ${
+                      quickLookMode === "text" ? "bg-blue-500/70 text-white" : "bg-white/10 text-gray-200 hover:bg-white/20"
+                    }`}
+                    onClick={() => setQuickLookMode("text")}
+                  >
+                    Texto
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-md bg-white/10 px-2 py-1 text-xs text-gray-200 hover:bg-white/20"
+                    onClick={() => setIsQuickLookOpen(false)}
+                  >
+                    Cerrar
+                  </button>
+                </div>
               </div>
 
               <div className="mt-3 h-[68vh] overflow-hidden rounded-md bg-black/30 ring-1 ring-white/10">
-                {isQuickLookImage && quickLookUrl && (
+                {quickLookMode === "visual" && isQuickLookImage && quickLookUrl && (
                   <img src={quickLookUrl} alt={quickLookItem.title} className="h-full w-full object-contain" loading="lazy" />
                 )}
 
-                {quickLookExt === "pdf" && quickLookUrl && (
+                {quickLookMode === "visual" && quickLookExt === "pdf" && quickLookUrl && (
                   <iframe title={`quicklook-modal-${quickLookItem.path}`} src={quickLookUrl} className="h-full w-full border-0" />
                 )}
 
-                {quickLookExt !== "pdf" && !isQuickLookImage && (
+                {quickLookMode === "visual" && !hasVisualPreview && (
                   <div className="flex h-full items-center justify-center px-6 text-center">
                     <p className="text-xs text-gray-500">Vista previa visual disponible para PDF e imágenes. Para este tipo de archivo, usa Abrir para verlo completo.</p>
+                  </div>
+                )}
+
+                {quickLookMode === "text" && (
+                  <div className="h-full overflow-y-auto p-4">
+                    {quickLookTextPreview?.available ? (
+                      <>
+                        <p className="mb-2 text-[11px] text-gray-500">Fuente: {quickLookTextPreview.source}</p>
+                        <pre className="whitespace-pre-wrap text-xs leading-relaxed text-gray-300">{quickLookTextPreview.text}</pre>
+                      </>
+                    ) : (
+                      <p className="text-xs text-gray-500">
+                        {quickLookTextPreview?.text ?? "No se pudo cargar vista textual para este archivo."}
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
