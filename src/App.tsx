@@ -63,6 +63,15 @@ type FileWatcherStatus = {
   last_error: string | null;
 };
 
+type ImageMetadata = {
+  path: string;
+  width: number | null;
+  height: number | null;
+  format: string | null;
+  date_taken: string | null;
+  orientation: string | null;
+};
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -88,6 +97,7 @@ function App() {
   const [watcherStatus, setWatcherStatus] = useState<FileWatcherStatus | null>(null);
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
   const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
+  const [quickLookImageMeta, setQuickLookImageMeta] = useState<ImageMetadata | null>(null);
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -524,6 +534,33 @@ function App() {
     }
   }, [quickLookItem?.path]);
 
+  const isQuickLookImage = quickLookExt === "png" || quickLookExt === "jpg" || quickLookExt === "jpeg" || quickLookExt === "webp" || quickLookExt === "gif" || quickLookExt === "bmp" || quickLookExt === "tiff";
+
+  useEffect(() => {
+    if (!quickLookItem?.path || !isQuickLookImage) {
+      setQuickLookImageMeta(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    void invoke<ImageMetadata>("get_image_metadata", { path: quickLookItem.path })
+      .then((meta) => {
+        if (!cancelled) {
+          setQuickLookImageMeta(meta);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setQuickLookImageMeta(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [quickLookItem?.path, isQuickLookImage]);
+
   return (
     <div
       className="min-h-screen w-full bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-[#0a0b0f] via-[#020203] to-[#010101] flex flex-col items-center justify-start px-5 pb-5 pt-8"
@@ -846,8 +883,15 @@ function App() {
                   <p className="mt-2 truncate text-xs text-gray-300">{quickLookItem.title}</p>
                   <p className="truncate text-[10px] text-gray-500">{quickLookItem.path}</p>
 
+                  {isQuickLookImage && quickLookImageMeta && (
+                    <p className="mt-1 truncate text-[10px] text-gray-400">
+                      {quickLookImageMeta.format ?? quickLookExt.toUpperCase()} · {quickLookImageMeta.width ?? "?"}x{quickLookImageMeta.height ?? "?"}
+                      {quickLookImageMeta.date_taken ? ` · ${quickLookImageMeta.date_taken}` : ""}
+                    </p>
+                  )}
+
                   <div className="mt-3 h-[46vh] overflow-hidden rounded-md bg-black/30 ring-1 ring-white/10">
-                    {(quickLookExt === "png" || quickLookExt === "jpg" || quickLookExt === "jpeg" || quickLookExt === "webp" || quickLookExt === "gif") && quickLookUrl && (
+                    {isQuickLookImage && quickLookUrl && (
                       <img src={quickLookUrl} alt={quickLookItem.title} className="h-full w-full object-contain" loading="lazy" />
                     )}
 
@@ -855,7 +899,7 @@ function App() {
                       <iframe title={`quicklook-${quickLookItem.path}`} src={quickLookUrl} className="h-full w-full border-0" />
                     )}
 
-                    {quickLookExt !== "pdf" && quickLookExt !== "png" && quickLookExt !== "jpg" && quickLookExt !== "jpeg" && quickLookExt !== "webp" && quickLookExt !== "gif" && (
+                    {quickLookExt !== "pdf" && !isQuickLookImage && (
                       <div className="flex h-full items-center justify-center px-3 text-center">
                         <p className="text-xs text-gray-500">Vista previa visual disponible para PDF e imágenes. Para otros tipos, usa el snippet y el botón Abrir.</p>
                       </div>

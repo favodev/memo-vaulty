@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
 use std::fs;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
 use rusqlite::{params, params_from_iter, Connection};
 use tauri::{Emitter, Manager, State};
+use exif::{In, Reader as ExifReader, Tag};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -47,6 +50,16 @@ struct SearchResultItem {
     snippet: String,
 }
 
+#[derive(Serialize)]
+struct ImageMetadata {
+    path: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    format: Option<String>,
+    date_taken: Option<String>,
+    orientation: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct IndexedFileItem {
     title: String,
@@ -55,6 +68,21 @@ struct IndexedFileItem {
     size_bytes: u64,
     modified_unix_secs: u64,
     content_excerpt: Option<String>,
+}
+
+#[tauri::command]
+fn get_image_metadata(path: String) -> Result<ImageMetadata, String> {
+    let image_path = PathBuf::from(&path);
+
+    if !image_path.exists() {
+        return Err("La imagen no existe".to_string());
+    }
+
+    if !is_image_path(&image_path) {
+        return Err("El archivo no es una imagen soportada".to_string());
+    }
+
+    Ok(read_image_metadata(&image_path))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1339,7 +1367,10 @@ fn needs_content_refresh(path: &Path, previous: &IndexedFileItem) -> bool {
         .map(|value| value.to_lowercase())
         .unwrap_or_default();
 
-    matches!(extension.as_str(), "txt" | "md" | "pdf")
+    matches!(
+        extension.as_str(),
+        "txt" | "md" | "pdf" | "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff"
+    )
 }
 
 fn extract_indexable_text(path: &Path) -> Option<String> {
@@ -1349,6 +1380,10 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_lowercase())?;
+
+    if is_image_extension(&extension) {
+        return extract_image_metadata_text(path);
+    }
 
     if extension != "txt" && extension != "md" {
         return None;
@@ -1364,6 +1399,83 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
     } else {
         Some(normalized)
     }
+}
+
+fn extract_image_metadata_text(path: &Path) -> Option<String> {
+    let metadata = read_image_metadata(path);
+
+    let mut parts = vec!["imagen".to_string()];
+
+    if let Some(format) = metadata.format {
+        parts.push(format.to_lowercase());
+    }
+
+    if let (Some(width), Some(height)) = (metadata.width, metadata.height) {
+        parts.push(format!("{}x{}", width, height));
+        parts.push(format!("{} {}", width, height));
+    }
+
+    if let Some(date_taken) = metadata.date_taken {
+        parts.push(date_taken.to_lowercase());
+    }
+
+    if let Some(orientation) = metadata.orientation {
+        parts.push(orientation.to_lowercase());
+    }
+
+    let joined = parts.join(" ");
+    let normalized = normalize_text_for_index(&joined, 600);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn read_image_metadata(path: &Path) -> ImageMetadata {
+    let dimensions = image::image_dimensions(path).ok();
+    let format = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|value| value.to_uppercase());
+
+    let mut date_taken = None;
+    let mut orientation = None;
+
+    if let Ok(file) = File::open(path) {
+        let mut reader = BufReader::new(file);
+        if let Ok(exif) = ExifReader::new().read_from_container(&mut reader) {
+            if let Some(field) = exif.get_field(Tag::DateTimeOriginal, In::PRIMARY) {
+                date_taken = Some(field.display_value().with_unit(&exif).to_string());
+            } else if let Some(field) = exif.get_field(Tag::DateTime, In::PRIMARY) {
+                date_taken = Some(field.display_value().with_unit(&exif).to_string());
+            }
+
+            if let Some(field) = exif.get_field(Tag::Orientation, In::PRIMARY) {
+                orientation = Some(field.display_value().with_unit(&exif).to_string());
+            }
+        }
+    }
+
+    ImageMetadata {
+        path: path.to_string_lossy().to_string(),
+        width: dimensions.map(|value| value.0),
+        height: dimensions.map(|value| value.1),
+        format,
+        date_taken,
+        orientation,
+    }
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|value| is_image_extension(&value.to_lowercase()))
+        .unwrap_or(false)
+}
+
+fn is_image_extension(ext: &str) -> bool {
+    matches!(ext, "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff")
 }
 
 fn extract_pdf_text(path: &Path) -> Option<(String, bool)> {
@@ -2283,6 +2395,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             open_file,
+            get_image_metadata,
             search_stub,
             semantic_search,
             start_indexing,

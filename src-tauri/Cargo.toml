@@ -32,4 +32,6 @@ arrow-array = "52.2"
 arrow-schema = "52.2"
 lopdf = "0.35"
 futures = "0.3"
+image = "0.25"
+kamadak-exif = "0.6"
 
