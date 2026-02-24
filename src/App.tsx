@@ -98,6 +98,7 @@ function App() {
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
   const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
   const [quickLookImageMeta, setQuickLookImageMeta] = useState<ImageMetadata | null>(null);
+  const [isQuickLookOpen, setIsQuickLookOpen] = useState(false);
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -800,6 +801,11 @@ function App() {
               }
 
               if (e.key === "Escape") {
+                if (isQuickLookOpen) {
+                  setIsQuickLookOpen(false);
+                  return;
+                }
+
                 setResults([]);
                 setHasSearched(false);
                 setErrorMessage(null);
@@ -824,90 +830,59 @@ function App() {
         )}
 
         {!isLoading && results.length > 0 && (
-          <div className="mt-5 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(280px,360px)]">
-            <div className="max-h-[62vh] space-y-2 overflow-y-auto pr-1 pb-2">
-              {results.map((item, index) => (
-                <div
-                  key={item.path}
-                  className={`rounded-lg px-4 py-3 transition-colors ${
-                    selectedIndex === index ? "bg-white/10" : "bg-white/4"
-                  }`}
-                  onMouseEnter={() => {
-                    setSelectedIndex(index);
-                    setQuickLookPath(item.path);
-                  }}
-                  onClick={() => {
-                    setSelectedIndex(index);
-                    setQuickLookPath(item.path);
-                  }}
-                  onDoubleClick={() => {
-                    void openFile(item.path);
-                  }}
-                >
-                  <p className="text-sm font-medium text-white">{renderHighlighted(item.title)}</p>
-                  <p className="mt-1 text-xs text-gray-400">{renderHighlighted(item.snippet)}</p>
-                  <p className="mt-1 text-[11px] text-gray-500 truncate">{item.path}</p>
-                  <div className="mt-2 flex items-center gap-2">
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
-                      onClick={() => {
-                        void openFile(item.path);
-                      }}
-                    >
-                      Abrir
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/5 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:bg-white/15"
-                      onClick={() => {
-                        void openContainingFolder(item.path);
-                      }}
-                    >
-                      Carpeta
-                    </button>
-                  </div>
+          <div className="mt-5 max-h-[62vh] space-y-2 overflow-y-auto pr-1 pb-2">
+            {results.map((item, index) => (
+              <div
+                key={item.path}
+                className={`rounded-lg px-4 py-3 transition-colors ${
+                  selectedIndex === index ? "bg-white/10" : "bg-white/4"
+                }`}
+                onMouseEnter={() => {
+                  setSelectedIndex(index);
+                }}
+                onClick={() => {
+                  setSelectedIndex(index);
+                }}
+                onDoubleClick={() => {
+                  void openFile(item.path);
+                }}
+              >
+                <p className="text-sm font-medium text-white">{renderHighlighted(item.title)}</p>
+                <p className="mt-1 text-xs text-gray-400">{renderHighlighted(item.snippet)}</p>
+                <p className="mt-1 text-[11px] text-gray-500 truncate">{item.path}</p>
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
+                    onClick={() => {
+                      void openFile(item.path);
+                    }}
+                  >
+                    Abrir
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-md bg-white/5 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:bg-white/15"
+                    onClick={() => {
+                      void openContainingFolder(item.path);
+                    }}
+                  >
+                    Carpeta
+                  </button>
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 rounded-md bg-white/5 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:bg-white/15"
+                    onClick={() => {
+                      setQuickLookPath(item.path);
+                      setIsQuickLookOpen(true);
+                    }}
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
+                    Ver
+                  </button>
                 </div>
-              ))}
-            </div>
-
-            <div className="max-h-[62vh] overflow-hidden rounded-lg bg-white/4 p-3 ring-1 ring-white/10">
-              <p className="text-[11px] uppercase tracking-wide text-gray-500">Quick Look</p>
-
-              {!quickLookItem && (
-                <p className="mt-2 text-xs text-gray-500">Selecciona un resultado para previsualizar.</p>
-              )}
-
-              {quickLookItem && (
-                <>
-                  <p className="mt-2 truncate text-xs text-gray-300">{quickLookItem.title}</p>
-                  <p className="truncate text-[10px] text-gray-500">{quickLookItem.path}</p>
-
-                  {isQuickLookImage && quickLookImageMeta && (
-                    <p className="mt-1 truncate text-[10px] text-gray-400">
-                      {quickLookImageMeta.format ?? quickLookExt.toUpperCase()} · {quickLookImageMeta.width ?? "?"}x{quickLookImageMeta.height ?? "?"}
-                      {quickLookImageMeta.date_taken ? ` · ${quickLookImageMeta.date_taken}` : ""}
-                    </p>
-                  )}
-
-                  <div className="mt-3 h-[46vh] overflow-hidden rounded-md bg-black/30 ring-1 ring-white/10">
-                    {isQuickLookImage && quickLookUrl && (
-                      <img src={quickLookUrl} alt={quickLookItem.title} className="h-full w-full object-contain" loading="lazy" />
-                    )}
-
-                    {quickLookExt === "pdf" && quickLookUrl && (
-                      <iframe title={`quicklook-${quickLookItem.path}`} src={quickLookUrl} className="h-full w-full border-0" />
-                    )}
-
-                    {quickLookExt !== "pdf" && !isQuickLookImage && (
-                      <div className="flex h-full items-center justify-center px-3 text-center">
-                        <p className="text-xs text-gray-500">Vista previa visual disponible para PDF e imágenes. Para otros tipos, usa el snippet y el botón Abrir.</p>
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
+              </div>
+            ))}
           </div>
         )}
 
@@ -915,11 +890,11 @@ function App() {
 
         {isConfigOpen && (
           <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4"
+            className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/75 p-4 pt-8 backdrop-blur-sm"
             onClick={() => setIsConfigOpen(false)}
           >
             <div
-              className="w-full max-w-2xl rounded-xl bg-[#07090d] p-4 shadow-xl ring-1 ring-white/10"
+              className="w-full max-w-3xl rounded-xl bg-[#07090d] p-4 shadow-xl ring-1 ring-white/10 max-h-[88vh] overflow-y-auto"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="flex items-center justify-between">
@@ -1137,6 +1112,56 @@ function App() {
                   </button>
                 </div>
               </div>
+            </div>
+          </div>
+        )}
+
+        {isQuickLookOpen && quickLookItem && (
+          <div
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+            onClick={() => setIsQuickLookOpen(false)}
+          >
+            <div
+              className="w-full max-w-5xl rounded-xl bg-[#07090d] p-4 shadow-xl ring-1 ring-white/10 max-h-[88vh] overflow-y-auto"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-white">{quickLookItem.title}</p>
+                  <p className="truncate text-[11px] text-gray-500">{quickLookItem.path}</p>
+                  {isQuickLookImage && quickLookImageMeta && (
+                    <p className="truncate text-[10px] text-gray-400">
+                      {quickLookImageMeta.format ?? quickLookExt.toUpperCase()} · {quickLookImageMeta.width ?? "?"}x{quickLookImageMeta.height ?? "?"}
+                      {quickLookImageMeta.date_taken ? ` · ${quickLookImageMeta.date_taken}` : ""}
+                    </p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="rounded-md bg-white/10 px-2 py-1 text-xs text-gray-200 hover:bg-white/20"
+                  onClick={() => setIsQuickLookOpen(false)}
+                >
+                  Cerrar
+                </button>
+              </div>
+
+              <div className="mt-3 h-[68vh] overflow-hidden rounded-md bg-black/30 ring-1 ring-white/10">
+                {isQuickLookImage && quickLookUrl && (
+                  <img src={quickLookUrl} alt={quickLookItem.title} className="h-full w-full object-contain" loading="lazy" />
+                )}
+
+                {quickLookExt === "pdf" && quickLookUrl && (
+                  <iframe title={`quicklook-modal-${quickLookItem.path}`} src={quickLookUrl} className="h-full w-full border-0" />
+                )}
+
+                {quickLookExt !== "pdf" && !isQuickLookImage && (
+                  <div className="flex h-full items-center justify-center px-6 text-center">
+                    <p className="text-xs text-gray-500">Vista previa visual disponible para PDF e imágenes. Para este tipo de archivo, usa Abrir para verlo completo.</p>
+                  </div>
+                )}
+              </div>
+
+              <p className="mt-2 text-[11px] text-gray-500">Snippet: {quickLookItem.snippet}</p>
             </div>
           </div>
         )}
