@@ -18,6 +18,8 @@ use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
 use rusqlite::{params, params_from_iter, Connection};
 use tauri::{Emitter, Manager, State};
 use exif::{In, Reader as ExifReader, Tag};
+use tract_onnx::prelude::*;
+use tokenizers::Tokenizer;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -71,6 +73,8 @@ struct FileTextPreview {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct RagSourceItem {
+    #[serde(default)]
+    ref_id: String,
     title: String,
     path: String,
     snippet: String,
@@ -91,9 +95,62 @@ struct ChatHistoryItem {
     timestamp: String,
     query: String,
     answer: String,
+    #[serde(default)]
     grounded: bool,
+    #[serde(default = "default_mode_value")]
     mode: String,
+    #[serde(default)]
     sources: Vec<RagSourceItem>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AuditLogEntry {
+    timestamp: String,
+    event: String,
+    detail: String,
+}
+
+#[derive(Default)]
+struct RuntimeMetricsState {
+    semantic_calls: u64,
+    semantic_total_ms: u64,
+    rag_calls: u64,
+    rag_total_ms: u64,
+    indexing_runs: u64,
+    indexing_total_ms: u64,
+    last_index_ms: u64,
+}
+
+#[derive(Serialize)]
+struct RuntimeMetrics {
+    semantic_calls: u64,
+    semantic_avg_ms: f32,
+    rag_calls: u64,
+    rag_avg_ms: f32,
+    indexing_runs: u64,
+    indexing_avg_ms: f32,
+    last_index_ms: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ClipOnnxConfig {
+    enabled: bool,
+    image_model_path: String,
+    text_model_path: String,
+    tokenizer_path: String,
+    input_size: u32,
+    max_length: usize,
+}
+
+#[derive(Serialize)]
+struct ClipOnnxStatus {
+    configured: bool,
+    enabled: bool,
+    image_model_path: String,
+    text_model_path: String,
+    tokenizer_path: String,
+    input_size: u32,
+    max_length: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -232,7 +289,9 @@ struct AiProviderConfig {
     provider: String,
     base_url: String,
     embedding_model: String,
+    #[serde(default = "default_chat_base_url_value")]
     chat_base_url: String,
+    #[serde(default = "default_chat_model_value")]
     chat_model: String,
     api_key: String,
 }
@@ -324,6 +383,10 @@ struct AppState {
     watcher_runtime: Mutex<Option<FileWatcherRuntime>>,
     watcher_status: Mutex<FileWatcherStatus>,
     is_indexing: AtomicBool,
+    audit_logs: Mutex<Vec<AuditLogEntry>>,
+    runtime_metrics: Mutex<RuntimeMetricsState>,
+    clip_config: Mutex<Option<ClipOnnxConfig>>,
+    clip_image_cache: Mutex<HashMap<String, Vec<f32>>>,
 }
 
 impl Default for AppState {
@@ -337,6 +400,10 @@ impl Default for AppState {
             watcher_runtime: Mutex::new(None),
             watcher_status: Mutex::new(FileWatcherStatus::default()),
             is_indexing: AtomicBool::new(false),
+            audit_logs: Mutex::new(Vec::new()),
+            runtime_metrics: Mutex::new(RuntimeMetricsState::default()),
+            clip_config: Mutex::new(None),
+            clip_image_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -364,6 +431,81 @@ fn get_file_watcher_status(state: State<'_, AppState>) -> FileWatcherStatus {
         .lock()
         .map(|value| value.clone())
         .unwrap_or_default()
+}
+
+#[tauri::command]
+fn get_runtime_metrics(state: State<'_, AppState>) -> RuntimeMetrics {
+    let guard = match state.runtime_metrics.lock() {
+        Ok(value) => value,
+        Err(_) => {
+            return RuntimeMetrics {
+                semantic_calls: 0,
+                semantic_avg_ms: 0.0,
+                rag_calls: 0,
+                rag_avg_ms: 0.0,
+                indexing_runs: 0,
+                indexing_avg_ms: 0.0,
+                last_index_ms: 0,
+            }
+        }
+    };
+
+    RuntimeMetrics {
+        semantic_calls: guard.semantic_calls,
+        semantic_avg_ms: compute_avg_ms(guard.semantic_total_ms, guard.semantic_calls),
+        rag_calls: guard.rag_calls,
+        rag_avg_ms: compute_avg_ms(guard.rag_total_ms, guard.rag_calls),
+        indexing_runs: guard.indexing_runs,
+        indexing_avg_ms: compute_avg_ms(guard.indexing_total_ms, guard.indexing_runs),
+        last_index_ms: guard.last_index_ms,
+    }
+}
+
+#[tauri::command]
+fn get_audit_logs(state: State<'_, AppState>, limit: Option<usize>) -> Vec<AuditLogEntry> {
+    let max = limit.unwrap_or(50).clamp(1, 300);
+    state
+        .audit_logs
+        .lock()
+        .map(|logs| logs.iter().rev().take(max).cloned().collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn clear_audit_logs(state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state
+        .audit_logs
+        .lock()
+        .map_err(|_| "No se pudo limpiar auditoría".to_string())?;
+    guard.clear();
+    Ok(())
+}
+
+#[tauri::command]
+fn export_audit_logs_to_file(
+    state: State<'_, AppState>,
+    path: String,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let max = limit.unwrap_or(300).clamp(1, 1000);
+    let logs = state
+        .audit_logs
+        .lock()
+        .map(|value| value.iter().rev().take(max).cloned().collect::<Vec<_>>())
+        .map_err(|_| "No se pudo leer auditoría".to_string())?;
+
+    let target = PathBuf::from(path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("No se pudo crear carpeta destino: {err}"))?;
+    }
+
+    let serialized = serde_json::to_string_pretty(&logs)
+        .map_err(|err| format!("No se pudo serializar auditoría: {err}"))?;
+    fs::write(&target, serialized)
+        .map_err(|err| format!("No se pudo exportar auditoría: {err}"))?;
+
+    Ok(target.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -500,6 +642,18 @@ fn configure_ai_provider(
         *guard = Some(config.clone());
     }
 
+    append_audit_log(
+        state.inner(),
+        "ai.config.updated",
+        format!(
+            "provider={} embedding_model={} chat_model={} key={}",
+            config.provider,
+            config.embedding_model,
+            config.chat_model,
+            mask_api_key(&config.api_key)
+        ),
+    );
+
     Ok(ai_provider_status_from_config(Some(&config)))
 }
 
@@ -508,6 +662,167 @@ fn get_ai_provider_status(state: State<'_, AppState>) -> AiProviderStatus {
     let guard = state.ai_config.lock().ok();
     let maybe_cfg = guard.and_then(|value| value.as_ref().cloned());
     ai_provider_status_from_config(maybe_cfg.as_ref())
+}
+
+#[tauri::command]
+fn configure_clip_onnx(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    image_model_path: String,
+    text_model_path: String,
+    tokenizer_path: String,
+    input_size: Option<u32>,
+    max_length: Option<usize>,
+    enabled: Option<bool>,
+) -> Result<ClipOnnxStatus, String> {
+    let image_path = PathBuf::from(image_model_path.trim());
+    let text_path = PathBuf::from(text_model_path.trim());
+    let tokenizer = PathBuf::from(tokenizer_path.trim());
+
+    if !image_path.exists() || !text_path.exists() || !tokenizer.exists() {
+        return Err("Rutas de CLIP/ONNX inválidas: verifica modelo imagen, modelo texto y tokenizer".to_string());
+    }
+
+    let config = ClipOnnxConfig {
+        enabled: enabled.unwrap_or(true),
+        image_model_path: image_path.to_string_lossy().to_string(),
+        text_model_path: text_path.to_string_lossy().to_string(),
+        tokenizer_path: tokenizer.to_string_lossy().to_string(),
+        input_size: input_size.unwrap_or(224).clamp(128, 512),
+        max_length: max_length.unwrap_or(77).clamp(16, 256),
+    };
+
+    save_clip_config(&app, &config)?;
+
+    {
+        let mut guard = state
+            .clip_config
+            .lock()
+            .map_err(|_| "No se pudo actualizar config CLIP".to_string())?;
+        *guard = Some(config.clone());
+    }
+
+    if let Ok(mut cache) = state.clip_image_cache.lock() {
+        cache.clear();
+    }
+
+    append_audit_log(
+        state.inner(),
+        "clip.config.updated",
+        format!(
+            "enabled={} input_size={} max_length={}",
+            config.enabled, config.input_size, config.max_length
+        ),
+    );
+
+    Ok(clip_status_from_config(Some(&config)))
+}
+
+#[tauri::command]
+fn get_clip_onnx_status(state: State<'_, AppState>) -> ClipOnnxStatus {
+    let guard = state.clip_config.lock().ok();
+    let maybe_cfg = guard.and_then(|value| value.as_ref().cloned());
+    clip_status_from_config(maybe_cfg.as_ref())
+}
+
+#[tauri::command]
+fn clip_text_to_image_search(
+    _app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+    roots: Option<Vec<String>>,
+    excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+) -> Result<Vec<SearchResultItem>, String> {
+    let clean_query = query.trim();
+    if clean_query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let config = state
+        .clip_config
+        .lock()
+        .ok()
+        .and_then(|value| value.as_ref().cloned())
+        .filter(|value| value.enabled)
+        .ok_or_else(|| "CLIP/ONNX no está configurado o está desactivado".to_string())?;
+
+    let query_embedding = run_clip_text_embedding(&config, clean_query)?;
+    if query_embedding.is_empty() {
+        return Err("No se pudo obtener embedding de texto CLIP".to_string());
+    }
+
+    let search_roots = resolve_roots(roots);
+    let exclusions = normalize_extensions(excluded_extensions);
+    let folder_exclusions = normalize_folder_rules(excluded_folders);
+    let max_file_size_bytes = max_size_bytes(max_file_size_mb);
+    let max_results = limit.unwrap_or(20).clamp(1, 50);
+
+    let snapshot_items = state
+        .index
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.files.clone()))
+        .unwrap_or_default();
+
+    if snapshot_items.is_empty() {
+        return Err("No hay índice local para buscar imágenes con CLIP".to_string());
+    }
+
+    let mut scored = Vec::<(f32, IndexedFileItem)>::new();
+    let mut inspected = 0usize;
+
+    for item in snapshot_items {
+        let path_buf = PathBuf::from(&item.path);
+        if !is_image_path(&path_buf) {
+            continue;
+        }
+
+        if !matches_roots(&path_buf, &search_roots)
+            || should_skip_custom_dir(&path_buf, &folder_exclusions)
+            || is_excluded_file(&path_buf, &exclusions)
+            || item.size_bytes > max_file_size_bytes
+        {
+            continue;
+        }
+
+        inspected += 1;
+        if inspected > 900 {
+            break;
+        }
+
+        let image_embedding = load_or_compute_clip_image_embedding(state.inner(), &config, &item.path)?;
+        if image_embedding.is_empty() {
+            continue;
+        }
+
+        let score = cosine_similarity(&query_embedding, &image_embedding);
+        scored.push((score, item));
+    }
+
+    scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+
+    let results = scored
+        .into_iter()
+        .take(max_results)
+        .map(|(score, item)| SearchResultItem {
+            title: item.title,
+            path: item.path,
+            snippet: format!("CLIP/ONNX {:.3} · búsqueda texto→imagen local", score),
+            match_reason: format!("Similaridad CLIP entre texto y embedding visual (score {:.3})", score),
+            origin: "local-clip-onnx".to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    append_audit_log(
+        state.inner(),
+        "search.clip_onnx",
+        format!("query_len={} inspected={} results={}", clean_query.chars().count(), inspected, results.len()),
+    );
+
+    Ok(results)
 }
 
 #[tauri::command]
@@ -522,6 +837,7 @@ async fn semantic_search(
     max_file_size_mb: Option<u64>,
     images_only: Option<bool>,
 ) -> Result<Vec<SearchResultItem>, String> {
+    let started_at = Instant::now();
     let clean_query = query.trim();
     if clean_query.is_empty() {
         return Ok(Vec::new());
@@ -559,6 +875,12 @@ async fn semantic_search(
     };
 
     if candidates.is_empty() {
+        record_runtime_metric(state.inner(), "semantic", started_at.elapsed().as_millis() as u64);
+        append_audit_log(
+            state.inner(),
+            "search.semantic",
+            format!("results=0 images_only={images_only} query_len={}", clean_query.chars().count()),
+        );
         return Ok(Vec::new());
     }
 
@@ -591,7 +913,7 @@ async fn semantic_search(
 
             scored.sort_by(|left, right| right.0.total_cmp(&left.0));
 
-            let results = scored
+            let results: Vec<SearchResultItem> = scored
                 .into_iter()
                 .take(max_results)
                 .map(|(score, item)| {
@@ -616,6 +938,13 @@ async fn semantic_search(
                     }
                 })
                 .collect();
+
+            record_runtime_metric(state.inner(), "semantic", started_at.elapsed().as_millis() as u64);
+            append_audit_log(
+                state.inner(),
+                "search.semantic",
+                format!("results={} mode=cloud images_only={images_only}", results.len()),
+            );
 
             return Ok(results);
         }
@@ -648,6 +977,12 @@ async fn semantic_search(
         .collect::<Vec<_>>();
 
     lexical.truncate(max_results);
+    record_runtime_metric(state.inner(), "semantic", started_at.elapsed().as_millis() as u64);
+    append_audit_log(
+        state.inner(),
+        "search.semantic",
+        format!("results={} mode=local images_only={images_only}", lexical.len()),
+    );
     Ok(lexical)
 }
 
@@ -662,7 +997,10 @@ async fn answer_with_local_context(
     max_file_size_mb: Option<u64>,
     top_k: Option<usize>,
     mode: Option<String>,
+    strict_grounding: Option<bool>,
+    min_score: Option<f32>,
 ) -> Result<RagAnswerResponse, String> {
+    let started_at = Instant::now();
     let clean_query = query.trim();
     if clean_query.is_empty() {
         return Ok(RagAnswerResponse {
@@ -688,6 +1026,8 @@ async fn answer_with_local_context(
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
     let max_sources = top_k.unwrap_or(4).clamp(1, 8);
+    let strict_grounding = strict_grounding.unwrap_or(true);
+    let min_score = min_score.unwrap_or(0.55).clamp(0.0, 1.6);
 
     let candidates = match load_chunk_candidates_from_lancedb(
         &app,
@@ -745,13 +1085,48 @@ async fn answer_with_local_context(
 
     let sources = selected
         .iter()
-        .map(|item| RagSourceItem {
+        .enumerate()
+        .map(|(index, item)| RagSourceItem {
+            ref_id: format!("S{}", index + 1),
             title: item.title.clone(),
             path: item.path.clone(),
             snippet: build_chunk_snippet(&item.chunk_text, clean_query),
             score: item.lexical_score,
         })
         .collect::<Vec<_>>();
+
+    let strongest_score = selected
+        .iter()
+        .map(|item| item.lexical_score)
+        .fold(0.0f32, f32::max);
+
+    if strict_grounding && strongest_score < min_score {
+        let response = RagAnswerResponse {
+            answer: format!(
+                "No tengo evidencia local suficiente para responder con confianza (score {:.2} < {:.2}). Ajusta la consulta, aumenta k o reindexa.",
+                strongest_score,
+                min_score
+            ),
+            grounded: false,
+            mode: "local".to_string(),
+            sources,
+        };
+
+        let _ = append_chat_history(
+            &app,
+            &ChatHistoryItem {
+                id: now_millis_string(),
+                timestamp: now_timestamp_string(),
+                query: clean_query.to_string(),
+                answer: response.answer.clone(),
+                grounded: response.grounded,
+                mode: response.mode.clone(),
+                sources: response.sources.clone(),
+            },
+        );
+
+        return Ok(response);
+    }
 
     let local_answer = build_local_grounded_answer(clean_query, &selected);
 
@@ -785,8 +1160,15 @@ async fn answer_with_local_context(
 
             match request_chat_answer(&config, clean_query, &context).await {
                 Ok(answer) if !answer.trim().is_empty() => {
-                    final_answer = answer;
-                    used_mode = "cloud".to_string();
+                    if cloud_answer_has_citations(&answer) {
+                        final_answer = answer;
+                        used_mode = "cloud".to_string();
+                    } else {
+                        final_answer = format!(
+                            "El proveedor cloud respondió sin citas inline [S#]. Fallback local:\n{}",
+                            local_answer
+                        );
+                    }
                 }
                 Ok(_) => {
                     if requested_mode == "cloud" {
@@ -833,6 +1215,20 @@ async fn answer_with_local_context(
         },
     );
 
+    record_runtime_metric(state.inner(), "rag", started_at.elapsed().as_millis() as u64);
+    append_audit_log(
+        state.inner(),
+        "rag.answer",
+        format!(
+            "mode={} grounded={} sources={} strict={} min_score={:.2}",
+            response.mode,
+            response.grounded,
+            response.sources.len(),
+            strict_grounding,
+            min_score
+        ),
+    );
+
     Ok(response)
 }
 
@@ -851,6 +1247,35 @@ fn get_chat_history(app: tauri::AppHandle, limit: Option<usize>) -> Result<Vec<C
 fn clear_chat_history(app: tauri::AppHandle) -> Result<(), String> {
     let path = chat_history_path(&app).ok_or_else(|| "No se pudo resolver ruta de historial".to_string())?;
     fs::write(path, "[]").map_err(|err| format!("No se pudo limpiar historial: {err}"))
+}
+
+#[tauri::command]
+fn export_chat_history_to_file(
+    app: tauri::AppHandle,
+    path: String,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let max = limit.unwrap_or(100).clamp(1, 300);
+    let history = load_chat_history(&app).unwrap_or_default();
+    let selected = history
+        .into_iter()
+        .rev()
+        .take(max)
+        .collect::<Vec<_>>();
+
+    let target = PathBuf::from(path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("No se pudo crear carpeta de exportación: {err}"))?;
+    }
+
+    let payload = serde_json::to_string_pretty(&selected)
+        .map_err(|err| format!("No se pudo serializar historial: {err}"))?;
+
+    fs::write(&target, payload)
+        .map_err(|err| format!("No se pudo exportar historial: {err}"))?;
+
+    Ok(target.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1093,6 +1518,7 @@ fn execute_indexing(
     settings: IndexingSettings,
     reason: &str,
 ) -> Result<IndexStatus, String> {
+    let started_at = Instant::now();
     if state
         .is_indexing
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1224,6 +1650,31 @@ fn execute_indexing(
     })();
 
     state.is_indexing.store(false, Ordering::SeqCst);
+
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    record_runtime_metric(state, "indexing", elapsed_ms);
+
+    match &result {
+        Ok(status) => {
+            append_audit_log(
+                state,
+                "indexing.completed",
+                format!(
+                    "reason={reason} indexed_files={} roots={} elapsed_ms={elapsed_ms}",
+                    status.indexed_files,
+                    status.roots.len()
+                ),
+            );
+        }
+        Err(err) => {
+            append_audit_log(
+                state,
+                "indexing.failed",
+                format!("reason={reason} elapsed_ms={elapsed_ms} error={}", sanitize_for_log(err)),
+            );
+        }
+    }
+
     result
 }
 
@@ -1300,6 +1751,8 @@ fn clear_index_data_internal(app: &tauri::AppHandle, state: &AppState) -> Result
         let _ = fs::remove_dir_all(&path);
         let _ = fs::create_dir_all(&path);
     }
+
+    append_audit_log(state, "indexing.cleared", "snapshot+sqlite+lancedb reset".to_string());
 
     Ok(current_index_status(state))
 }
@@ -2710,13 +3163,18 @@ fn build_local_grounded_answer(query: &str, candidates: &[ChunkCandidate]) -> St
     let mut lines = Vec::new();
     lines.push("Respuesta basada en tus archivos locales:".to_string());
 
-    for candidate in candidates.iter().take(3) {
+    for (index, candidate) in candidates.iter().take(3).enumerate() {
         let summary = build_compact_evidence_line(&candidate.chunk_text, query);
-        lines.push(format!("- {}", summary));
+        lines.push(format!("- {} [S{}]", summary, index + 1));
     }
 
-    lines.push("Si necesitas más precisión, abre las fuentes citadas y vuelve a preguntar con términos más específicos.".to_string());
+    lines.push("Si necesitas más precisión, abre las fuentes citadas [S1..] y vuelve a preguntar con términos más específicos.".to_string());
     lines.join("\n")
+}
+
+fn cloud_answer_has_citations(answer: &str) -> bool {
+    let lowered = answer.to_lowercase();
+    lowered.contains("[s1") || lowered.contains("[s2") || lowered.contains("[s3") || lowered.contains("[s4")
 }
 
 fn build_compact_evidence_line(content: &str, query: &str) -> String {
@@ -2783,10 +3241,244 @@ fn ai_provider_status_from_config(config: Option<&AiProviderConfig>) -> AiProvid
         provider: "openrouter-compatible".to_string(),
         base_url: "https://openrouter.ai/api/v1/embeddings".to_string(),
         embedding_model: "text-embedding-3-small".to_string(),
-        chat_base_url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
-        chat_model: "gpt-4o-mini".to_string(),
+        chat_base_url: default_chat_base_url_value(),
+        chat_model: default_chat_model_value(),
         api_key_hint: None,
     }
+}
+
+fn default_mode_value() -> String {
+    "local".to_string()
+}
+
+fn clip_status_from_config(config: Option<&ClipOnnxConfig>) -> ClipOnnxStatus {
+    if let Some(cfg) = config {
+        return ClipOnnxStatus {
+            configured: true,
+            enabled: cfg.enabled,
+            image_model_path: cfg.image_model_path.clone(),
+            text_model_path: cfg.text_model_path.clone(),
+            tokenizer_path: cfg.tokenizer_path.clone(),
+            input_size: cfg.input_size,
+            max_length: cfg.max_length,
+        };
+    }
+
+    ClipOnnxStatus {
+        configured: false,
+        enabled: false,
+        image_model_path: String::new(),
+        text_model_path: String::new(),
+        tokenizer_path: String::new(),
+        input_size: 224,
+        max_length: 77,
+    }
+}
+
+fn load_or_compute_clip_image_embedding(
+    state: &AppState,
+    config: &ClipOnnxConfig,
+    path: &str,
+) -> Result<Vec<f32>, String> {
+    if let Ok(cache) = state.clip_image_cache.lock() {
+        if let Some(value) = cache.get(path) {
+            return Ok(value.clone());
+        }
+    }
+
+    let embedding = run_clip_image_embedding(config, path)?;
+
+    if let Ok(mut cache) = state.clip_image_cache.lock() {
+        cache.insert(path.to_string(), embedding.clone());
+    }
+
+    Ok(embedding)
+}
+
+fn run_clip_text_embedding(config: &ClipOnnxConfig, query: &str) -> Result<Vec<f32>, String> {
+    let tokenizer = Tokenizer::from_file(&config.tokenizer_path)
+        .map_err(|err| format!("No se pudo cargar tokenizer CLIP: {err}"))?;
+    let encoding = tokenizer
+        .encode(query, true)
+        .map_err(|err| format!("No se pudo tokenizar consulta CLIP: {err}"))?;
+
+    let mut ids = encoding
+        .get_ids()
+        .iter()
+        .map(|value| *value as i64)
+        .collect::<Vec<i64>>();
+    let mut mask = encoding
+        .get_attention_mask()
+        .iter()
+        .map(|value| *value as i64)
+        .collect::<Vec<i64>>();
+
+    ids.truncate(config.max_length);
+    mask.truncate(config.max_length);
+
+    while ids.len() < config.max_length {
+        ids.push(0);
+    }
+    while mask.len() < config.max_length {
+        mask.push(0);
+    }
+
+    let input_ids = tract_ndarray::Array2::from_shape_vec((1, config.max_length), ids)
+        .map_err(|err| format!("Input ids CLIP inválidos: {err}"))?;
+    let attention_mask = tract_ndarray::Array2::from_shape_vec((1, config.max_length), mask)
+        .map_err(|err| format!("Attention mask CLIP inválida: {err}"))?;
+
+    let model = tract_onnx::onnx()
+        .model_for_path(&config.text_model_path)
+        .map_err(|err| format!("No se pudo abrir modelo de texto CLIP: {err}"))?
+        .into_optimized()
+        .map_err(|err| format!("No se pudo optimizar modelo de texto CLIP: {err}"))?
+        .into_runnable()
+        .map_err(|err| format!("No se pudo inicializar modelo de texto CLIP: {err}"))?;
+
+    let outputs = model
+        .run(tvec!(
+            input_ids.into_tensor().into(),
+            attention_mask.into_tensor().into()
+        ))
+        .map_err(|err| format!("Inferencia CLIP texto falló: {err}"))?;
+
+    tensor_to_embedding(&outputs[0])
+}
+
+fn run_clip_image_embedding(config: &ClipOnnxConfig, path: &str) -> Result<Vec<f32>, String> {
+    let image = image::open(path).map_err(|err| format!("No se pudo abrir imagen CLIP: {err}"))?;
+    let resized = image
+        .resize_exact(
+            config.input_size,
+            config.input_size,
+            image::imageops::FilterType::CatmullRom,
+        )
+        .to_rgb8();
+
+    let size = config.input_size as usize;
+    let mut data = vec![0f32; 1 * 3 * size * size];
+    let means = [0.48145466f32, 0.4578275, 0.40821073];
+    let stds = [0.26862954f32, 0.26130258, 0.27577711];
+
+    for y in 0..size {
+        for x in 0..size {
+            let pixel = resized.get_pixel(x as u32, y as u32);
+            let idx = y * size + x;
+
+            for c in 0..3 {
+                let raw = pixel[c] as f32 / 255.0;
+                let normalized = (raw - means[c]) / stds[c];
+                data[c * size * size + idx] = normalized;
+            }
+        }
+    }
+
+    let input = tract_ndarray::Array4::from_shape_vec((1, 3, size, size), data)
+        .map_err(|err| format!("Tensor de imagen CLIP inválido: {err}"))?;
+
+    let model = tract_onnx::onnx()
+        .model_for_path(&config.image_model_path)
+        .map_err(|err| format!("No se pudo abrir modelo de imagen CLIP: {err}"))?
+        .into_optimized()
+        .map_err(|err| format!("No se pudo optimizar modelo de imagen CLIP: {err}"))?
+        .into_runnable()
+        .map_err(|err| format!("No se pudo inicializar modelo de imagen CLIP: {err}"))?;
+
+    let outputs = model
+        .run(tvec!(input.into_tensor().into()))
+        .map_err(|err| format!("Inferencia CLIP imagen falló: {err}"))?;
+
+    tensor_to_embedding(&outputs[0])
+}
+
+fn tensor_to_embedding(value: &TValue) -> Result<Vec<f32>, String> {
+    let tensor = value
+        .to_array_view::<f32>()
+        .map_err(|err| format!("Salida tensor CLIP inválida: {err}"))?;
+
+    let shape = tensor.shape().to_vec();
+    if shape.is_empty() {
+        return Err("Salida CLIP vacía".to_string());
+    }
+
+    if shape.len() == 2 {
+        let dim = shape[1];
+        let mut out = Vec::with_capacity(dim);
+        for index in 0..dim {
+            out.push(tensor[[0, index]]);
+        }
+        return Ok(normalize_embedding(out));
+    }
+
+    if shape.len() == 3 {
+        let seq = shape[1].max(1);
+        let dim = shape[2];
+        let mut out = vec![0f32; dim];
+
+        for token_index in 0..seq {
+            for dim_index in 0..dim {
+                out[dim_index] += tensor[[0, token_index, dim_index]];
+            }
+        }
+
+        for value in &mut out {
+            *value /= seq as f32;
+        }
+
+        return Ok(normalize_embedding(out));
+    }
+
+    let flat = tensor.iter().copied().collect::<Vec<f32>>();
+    if flat.is_empty() {
+        return Err("Salida CLIP sin dimensiones útiles".to_string());
+    }
+
+    Ok(normalize_embedding(flat))
+}
+
+fn normalize_embedding(mut values: Vec<f32>) -> Vec<f32> {
+    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm <= 0.0 {
+        return values;
+    }
+
+    for value in &mut values {
+        *value /= norm;
+    }
+
+    values
+}
+
+fn clip_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("clip-onnx-config.json");
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    Some(path)
+}
+
+fn save_clip_config(app: &tauri::AppHandle, config: &ClipOnnxConfig) -> Result<(), String> {
+    let path = clip_config_path(app).ok_or_else(|| "No se pudo resolver ruta de config CLIP".to_string())?;
+    let serialized = serde_json::to_string(config)
+        .map_err(|err| format!("No se pudo serializar config CLIP: {err}"))?;
+    fs::write(path, serialized).map_err(|err| format!("No se pudo guardar config CLIP: {err}"))
+}
+
+fn load_clip_config(app: &tauri::AppHandle) -> Option<ClipOnnxConfig> {
+    let path = clip_config_path(app)?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<ClipOnnxConfig>(&content).ok()
+}
+
+fn default_chat_base_url_value() -> String {
+    "https://openrouter.ai/api/v1/chat/completions".to_string()
+}
+
+fn default_chat_model_value() -> String {
+    "gpt-4o-mini".to_string()
 }
 
 fn mask_api_key(value: &str) -> String {
@@ -2844,7 +3536,7 @@ async fn request_chat_answer(config: &AiProviderConfig, query: &str, context: &s
         "messages": [
             {
                 "role": "system",
-                "content": "Responde solo con base en el contexto proporcionado. Si falta evidencia, dilo explícitamente. Sé breve y preciso."
+                "content": "Responde solo con base en el contexto proporcionado. Si falta evidencia, dilo explícitamente. Sé breve y preciso. Incluye referencias inline tipo [S1], [S2] cuando uses evidencia."
             },
             {
                 "role": "user",
@@ -3100,6 +3792,59 @@ fn should_skip_dir(path: &Path) -> bool {
     )
 }
 
+fn compute_avg_ms(total_ms: u64, calls: u64) -> f32 {
+    if calls == 0 {
+        return 0.0;
+    }
+    total_ms as f32 / calls as f32
+}
+
+fn record_runtime_metric(state: &AppState, metric: &str, elapsed_ms: u64) {
+    if let Ok(mut guard) = state.runtime_metrics.lock() {
+        match metric {
+            "semantic" => {
+                guard.semantic_calls = guard.semantic_calls.saturating_add(1);
+                guard.semantic_total_ms = guard.semantic_total_ms.saturating_add(elapsed_ms);
+            }
+            "rag" => {
+                guard.rag_calls = guard.rag_calls.saturating_add(1);
+                guard.rag_total_ms = guard.rag_total_ms.saturating_add(elapsed_ms);
+            }
+            "indexing" => {
+                guard.indexing_runs = guard.indexing_runs.saturating_add(1);
+                guard.indexing_total_ms = guard.indexing_total_ms.saturating_add(elapsed_ms);
+                guard.last_index_ms = elapsed_ms;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn append_audit_log(state: &AppState, event: &str, detail: String) {
+    if let Ok(mut guard) = state.audit_logs.lock() {
+        guard.push(AuditLogEntry {
+            timestamp: now_timestamp_string(),
+            event: event.to_string(),
+            detail: sanitize_for_log(&detail),
+        });
+
+        if guard.len() > 1000 {
+            let drop_count = guard.len().saturating_sub(1000);
+            guard.drain(0..drop_count);
+        }
+    }
+}
+
+fn sanitize_for_log(input: &str) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact
+        .replace("Bearer ", "Bearer ****")
+        .replace("sk-", "sk-****")
+        .chars()
+        .take(420)
+        .collect()
+}
+
 fn now_timestamp_string() -> String {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => format!("{}", duration.as_secs()),
@@ -3167,6 +3912,12 @@ pub fn run() {
                 }
             }
 
+            if let Some(clip_config) = load_clip_config(app.handle()) {
+                if let Ok(mut guard) = app.state::<AppState>().clip_config.lock() {
+                    *guard = Some(clip_config);
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3183,6 +3934,13 @@ pub fn run() {
             start_file_watcher,
             stop_file_watcher,
             get_file_watcher_status,
+            get_runtime_metrics,
+            get_audit_logs,
+            clear_audit_logs,
+            export_audit_logs_to_file,
+            configure_clip_onnx,
+            get_clip_onnx_status,
+            clip_text_to_image_search,
             configure_ai_provider,
             get_ai_provider_status,
             clear_index_data,
@@ -3191,7 +3949,8 @@ pub fn run() {
             import_app_config_from_file,
             answer_with_local_context,
             get_chat_history,
-            clear_chat_history
+            clear_chat_history,
+            export_chat_history_to_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

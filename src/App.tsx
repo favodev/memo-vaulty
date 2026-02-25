@@ -83,6 +83,7 @@ type FileTextPreview = {
 };
 
 type RagSourceItem = {
+  ref_id: string;
   title: string;
   path: string;
   snippet: string;
@@ -104,6 +105,32 @@ type ChatHistoryItem = {
   grounded: boolean;
   mode: string;
   sources: RagSourceItem[];
+};
+
+type RuntimeMetrics = {
+  semantic_calls: number;
+  semantic_avg_ms: number;
+  rag_calls: number;
+  rag_avg_ms: number;
+  indexing_runs: number;
+  indexing_avg_ms: number;
+  last_index_ms: number;
+};
+
+type AuditLogEntry = {
+  timestamp: string;
+  event: string;
+  detail: string;
+};
+
+type ClipOnnxStatus = {
+  configured: boolean;
+  enabled: boolean;
+  image_model_path: string;
+  text_model_path: string;
+  tokenizer_path: string;
+  input_size: number;
+  max_length: number;
 };
 
 function App() {
@@ -145,8 +172,22 @@ function App() {
   const [isRagLoading, setIsRagLoading] = useState(false);
   const [ragResponse, setRagResponse] = useState<RagAnswerResponse | null>(null);
   const [answerMode, setAnswerMode] = useState<"auto" | "local" | "cloud">("auto");
+  const [ragTopK, setRagTopK] = useState("4");
+  const [strictGrounding, setStrictGrounding] = useState(true);
+  const [ragMinScore, setRagMinScore] = useState("0.55");
   const [chatHistory, setChatHistory] = useState<ChatHistoryItem[]>([]);
   const [isChatHistoryLoading, setIsChatHistoryLoading] = useState(false);
+  const [runtimeMetrics, setRuntimeMetrics] = useState<RuntimeMetrics | null>(null);
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
+  const [isAuditLoading, setIsAuditLoading] = useState(false);
+  const [clipStatus, setClipStatus] = useState<ClipOnnxStatus | null>(null);
+  const [clipImageModelPath, setClipImageModelPath] = useState("");
+  const [clipTextModelPath, setClipTextModelPath] = useState("");
+  const [clipTokenizerPath, setClipTokenizerPath] = useState("");
+  const [clipInputSize, setClipInputSize] = useState("224");
+  const [clipMaxLength, setClipMaxLength] = useState("77");
+  const [isClipSaving, setIsClipSaving] = useState(false);
+  const [isClipSearching, setIsClipSearching] = useState(false);
 
   const refreshStatus = async () => {
     try {
@@ -180,11 +221,45 @@ function App() {
     } catch {
       setWatcherStatus(null);
     }
+
+    try {
+      const metrics = await invoke<RuntimeMetrics>("get_runtime_metrics");
+      setRuntimeMetrics(metrics);
+    } catch {
+      setRuntimeMetrics(null);
+    }
+
+    try {
+      const status = await invoke<ClipOnnxStatus>("get_clip_onnx_status");
+      setClipStatus(status);
+      if (status.configured) {
+        setClipImageModelPath(status.image_model_path);
+        setClipTextModelPath(status.text_model_path);
+        setClipTokenizerPath(status.tokenizer_path);
+        setClipInputSize(String(status.input_size));
+        setClipMaxLength(String(status.max_length));
+      }
+    } catch {
+      setClipStatus(null);
+    }
+  };
+
+  const refreshAuditLogs = async () => {
+    setIsAuditLoading(true);
+    try {
+      const logs = await invoke<AuditLogEntry[]>("get_audit_logs", { limit: 20 });
+      setAuditLogs(logs);
+    } catch {
+      setAuditLogs([]);
+    } finally {
+      setIsAuditLoading(false);
+    }
   };
 
   useEffect(() => {
     void refreshStatus();
     void refreshChatHistory();
+    void refreshAuditLogs();
   }, []);
 
   const refreshChatHistory = async () => {
@@ -374,6 +449,10 @@ function App() {
 
       const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
       const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+      const parsedTopK = Number.parseInt(ragTopK, 10);
+      const topKValue = Number.isFinite(parsedTopK) && parsedTopK > 0 ? Math.min(parsedTopK, 8) : 4;
+      const parsedMinScore = Number.parseFloat(ragMinScore);
+      const minScoreValue = Number.isFinite(parsedMinScore) ? Math.max(0, Math.min(parsedMinScore, 1.6)) : 0.55;
 
       const response = await invoke<RagAnswerResponse>("answer_with_local_context", {
         query: cleanQuery,
@@ -381,8 +460,10 @@ function App() {
         excludedExtensions: exclusions,
         excludedFolders: excludedFolderRules,
         maxFileSizeMb: maxSizeValue,
-        topK: 4,
+        topK: topKValue,
         mode: answerMode,
+        strictGrounding,
+        minScore: minScoreValue,
       });
 
       setRagResponse(response);
@@ -402,6 +483,132 @@ function App() {
       setIndexFeedback({ type: "success", text: "Historial de chat limpiado" });
     } catch {
       setIndexFeedback({ type: "error", text: "No se pudo limpiar historial" });
+    } finally {
+      setIsChatHistoryLoading(false);
+    }
+  };
+
+  const clearAuditLogs = async () => {
+    setIsAuditLoading(true);
+    try {
+      await invoke("clear_audit_logs");
+      setAuditLogs([]);
+      setIndexFeedback({ type: "success", text: "Auditoría limpiada" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo limpiar auditoría" });
+    } finally {
+      setIsAuditLoading(false);
+    }
+  };
+
+  const exportAuditLogs = async () => {
+    const target = await saveDialog({
+      title: "Exportar auditoría",
+      defaultPath: "memovault-audit.json",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+
+    if (!target) {
+      return;
+    }
+
+    setIsAuditLoading(true);
+    try {
+      await invoke<string>("export_audit_logs_to_file", { path: target, limit: 300 });
+      setIndexFeedback({ type: "success", text: "Auditoría exportada" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo exportar auditoría" });
+    } finally {
+      setIsAuditLoading(false);
+    }
+  };
+
+  const saveClipConfig = async () => {
+    setIsClipSaving(true);
+    try {
+      const parsedInputSize = Number.parseInt(clipInputSize, 10);
+      const parsedMaxLength = Number.parseInt(clipMaxLength, 10);
+
+      const status = await invoke<ClipOnnxStatus>("configure_clip_onnx", {
+        imageModelPath: clipImageModelPath,
+        textModelPath: clipTextModelPath,
+        tokenizerPath: clipTokenizerPath,
+        inputSize: Number.isFinite(parsedInputSize) ? parsedInputSize : 224,
+        maxLength: Number.isFinite(parsedMaxLength) ? parsedMaxLength : 77,
+        enabled: true,
+      });
+
+      setClipStatus(status);
+      setIndexFeedback({ type: "success", text: "CLIP/ONNX configurado" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo configurar CLIP/ONNX" });
+    } finally {
+      setIsClipSaving(false);
+    }
+  };
+
+  const runClipImageSearch = async () => {
+    const cleanQuery = query.trim();
+    if (!cleanQuery) {
+      return;
+    }
+
+    setIsClipSearching(true);
+    setErrorMessage(null);
+
+    try {
+      const exclusions = excludedExtensions
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const excludedFolderRules = excludedFolders
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
+      const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+
+      const response = await invoke<SearchResultItem[]>("clip_text_to_image_search", {
+        query: cleanQuery,
+        limit: 30,
+        roots: searchRoots,
+        excludedExtensions: exclusions,
+        excludedFolders: excludedFolderRules,
+        maxFileSizeMb: maxSizeValue,
+      });
+
+      setResults(response);
+      setSelectedIndex(response.length > 0 ? 0 : -1);
+      setQuickLookPath(response.length > 0 ? response[0].path : null);
+      setSearchModeBadge("LOCAL");
+      setHasSearched(true);
+      setIndexFeedback({ type: "success", text: `CLIP encontró ${response.length} imágenes` });
+    } catch {
+      setIndexFeedback({ type: "error", text: "Búsqueda CLIP/ONNX falló" });
+    } finally {
+      setIsClipSearching(false);
+    }
+  };
+
+  const exportChatHistory = async () => {
+    const target = await saveDialog({
+      title: "Exportar historial de chat",
+      defaultPath: "memovault-chat-history.json",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+
+    if (!target) {
+      return;
+    }
+
+    setIsChatHistoryLoading(true);
+    try {
+      await invoke<string>("export_chat_history_to_file", { path: target, limit: 100 });
+      setIndexFeedback({ type: "success", text: "Historial exportado" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo exportar historial" });
     } finally {
       setIsChatHistoryLoading(false);
     }
@@ -1045,6 +1252,17 @@ function App() {
           </div>
         )}
 
+        {runtimeMetrics && (
+          <div className="mb-4 rounded-xl bg-white/4 p-3 ring-1 ring-white/10">
+            <p className="text-xs text-gray-300">
+              Métricas runtime · búsq semántica: <span className="text-white">{runtimeMetrics.semantic_calls}</span> ({runtimeMetrics.semantic_avg_ms.toFixed(1)} ms prom) · RAG: <span className="text-white">{runtimeMetrics.rag_calls}</span> ({runtimeMetrics.rag_avg_ms.toFixed(1)} ms prom)
+            </p>
+            <p className="mt-1 text-[11px] text-gray-500">
+              Indexaciones: {runtimeMetrics.indexing_runs} · promedio {runtimeMetrics.indexing_avg_ms.toFixed(0)} ms · última {runtimeMetrics.last_index_ms} ms
+            </p>
+          </div>
+        )}
+
         <div className="group flex items-center gap-3 rounded-xl bg-white/5 px-4 transition-all duration-300 focus-within:bg-white/10 ring-1 ring-white/10">
           <div className="text-gray-500 group-focus-within:text-blue-400 transition-colors pointer-events-none shrink-0">
             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-search"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
@@ -1133,6 +1351,18 @@ function App() {
             {isRagLoading ? "Respondiendo..." : "Responder"}
           </button>
 
+          <button
+            type="button"
+            className="shrink-0 rounded-md bg-violet-500/20 px-2 py-1 text-[10px] font-medium text-violet-300 ring-1 ring-violet-400/30 transition-colors hover:bg-violet-500/30"
+            onClick={() => {
+              void runClipImageSearch();
+            }}
+            disabled={isClipSearching}
+            title="Buscar imágenes por semántica CLIP ONNX"
+          >
+            {isClipSearching ? "CLIP..." : "CLIP Img"}
+          </button>
+
           <div className="flex shrink-0 items-center gap-1">
             <button
               type="button"
@@ -1158,6 +1388,40 @@ function App() {
             >
               CLOUD
             </button>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1 rounded-md bg-white/5 px-2 py-1 ring-1 ring-white/10">
+            <span className="text-[10px] text-gray-400">k</span>
+            <input
+              type="number"
+              min={1}
+              max={8}
+              className="w-10 border-0 bg-transparent text-[10px] text-gray-200 outline-none"
+              value={ragTopK}
+              onChange={(e) => setRagTopK(e.target.value)}
+              title="Número de fuentes para responder"
+            />
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1 rounded-md bg-white/5 px-2 py-1 ring-1 ring-white/10">
+            <button
+              type="button"
+              className={`rounded px-1.5 py-0.5 text-[10px] ${strictGrounding ? "bg-amber-500/20 text-amber-300" : "bg-white/10 text-gray-300"}`}
+              onClick={() => setStrictGrounding((value) => !value)}
+              title="Bloquea respuestas cuando la evidencia no alcance el umbral"
+            >
+              Estricto
+            </button>
+            <input
+              type="number"
+              min={0}
+              max={1.6}
+              step={0.05}
+              className="w-12 border-0 bg-transparent text-[10px] text-gray-200 outline-none"
+              value={ragMinScore}
+              onChange={(e) => setRagMinScore(e.target.value)}
+              title="Umbral mínimo de score"
+            />
           </div>
 
           {searchModeBadge && (
@@ -1218,7 +1482,10 @@ function App() {
               <div className="mt-3 space-y-2">
                 {ragResponse.sources.map((source) => (
                   <div key={`${source.path}-${source.score}`} className="rounded-md bg-white/5 p-2 ring-1 ring-white/10">
-                    <p className="truncate text-[11px] text-white">{source.title}</p>
+                    <div className="flex items-center gap-2">
+                      <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] text-gray-300">[{source.ref_id || "S?"}]</span>
+                      <p className="truncate text-[11px] text-white">{source.title}</p>
+                    </div>
                     <p className="mt-1 line-clamp-2 text-[11px] text-gray-400">{source.snippet}</p>
                     <div className="mt-1 flex items-center gap-2">
                       <p className="truncate text-[10px] text-gray-500">{source.path}</p>
@@ -1254,16 +1521,28 @@ function App() {
         <div className="mt-4 rounded-xl bg-white/4 p-4 ring-1 ring-white/10">
           <div className="flex items-center justify-between gap-2">
             <p className="text-xs font-medium text-white">Historial local de respuestas</p>
-            <button
-              type="button"
-              className="rounded-md bg-white/10 px-2 py-1 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
-              onClick={() => {
-                void clearChatHistory();
-              }}
-              disabled={isChatHistoryLoading}
-            >
-              Limpiar historial
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="rounded-md bg-white/10 px-2 py-1 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
+                onClick={() => {
+                  void exportChatHistory();
+                }}
+                disabled={isChatHistoryLoading}
+              >
+                Exportar
+              </button>
+              <button
+                type="button"
+                className="rounded-md bg-white/10 px-2 py-1 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
+                onClick={() => {
+                  void clearChatHistory();
+                }}
+                disabled={isChatHistoryLoading}
+              >
+                Limpiar historial
+              </button>
+            </div>
           </div>
 
           {chatHistory.length === 0 ? (
@@ -1274,7 +1553,12 @@ function App() {
                 <div key={entry.id} className="rounded-md bg-white/5 p-2 ring-1 ring-white/10">
                   <div className="flex items-center justify-between gap-2">
                     <p className="truncate text-[11px] text-white">{entry.query}</p>
-                    <span className="rounded-md bg-white/10 px-1.5 py-0.5 text-[10px] text-gray-300">{entry.mode.toUpperCase()}</span>
+                    <div className="flex items-center gap-1">
+                      <span className="rounded-md bg-white/10 px-1.5 py-0.5 text-[10px] text-gray-300">{entry.mode.toUpperCase()}</span>
+                      <span className={`rounded-md px-1.5 py-0.5 text-[10px] ${entry.grounded ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"}`}>
+                        {entry.grounded ? "OK" : "NO-EV"}
+                      </span>
+                    </div>
                   </div>
                   <p className="mt-1 line-clamp-2 text-[11px] text-gray-400">{entry.answer}</p>
                 </div>
@@ -1655,6 +1939,132 @@ function App() {
                     >
                       Reset índice local
                     </button>
+                  </div>
+                </div>
+
+                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-gray-400">Privacidad y auditoría</p>
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    Política: el contenido se indexa localmente por defecto. Solo se usa cloud cuando activas IA y eliges modo CLOUD/AUTO.
+                  </p>
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    Los logs de auditoría guardan eventos técnicos (sin exponer API keys completas) para diagnóstico.
+                  </p>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      disabled={isAuditLoading}
+                      onClick={() => {
+                        void refreshAuditLogs();
+                      }}
+                    >
+                      Refrescar logs
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      disabled={isAuditLoading}
+                      onClick={() => {
+                        void exportAuditLogs();
+                      }}
+                    >
+                      Exportar logs
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      disabled={isAuditLoading}
+                      onClick={() => {
+                        void clearAuditLogs();
+                      }}
+                    >
+                      Limpiar logs
+                    </button>
+                  </div>
+
+                  <div className="mt-2 max-h-28 space-y-1 overflow-y-auto rounded-md bg-black/20 p-2 ring-1 ring-white/10">
+                    {auditLogs.length === 0 ? (
+                      <p className="text-[10px] text-gray-500">Sin eventos de auditoría.</p>
+                    ) : (
+                      auditLogs.map((entry, index) => (
+                        <p key={`${entry.timestamp}-${entry.event}-${index}`} className="text-[10px] text-gray-400">
+                          [{entry.timestamp}] {entry.event} · {entry.detail}
+                        </p>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-gray-400">CLIP / ONNX (local)</p>
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    Configura modelos ONNX de texto e imagen + tokenizer para búsqueda semántica texto→imagen local.
+                  </p>
+
+                  <div className="mt-3 space-y-2">
+                    <input
+                      type="text"
+                      className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                      placeholder="Ruta modelo imagen ONNX"
+                      value={clipImageModelPath}
+                      onChange={(e) => setClipImageModelPath(e.target.value)}
+                    />
+                    <input
+                      type="text"
+                      className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                      placeholder="Ruta modelo texto ONNX"
+                      value={clipTextModelPath}
+                      onChange={(e) => setClipTextModelPath(e.target.value)}
+                    />
+                    <input
+                      type="text"
+                      className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                      placeholder="Ruta tokenizer.json"
+                      value={clipTokenizerPath}
+                      onChange={(e) => setClipTokenizerPath(e.target.value)}
+                    />
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="number"
+                        min={128}
+                        max={512}
+                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                        placeholder="Input size"
+                        value={clipInputSize}
+                        onChange={(e) => setClipInputSize(e.target.value)}
+                      />
+                      <input
+                        type="number"
+                        min={16}
+                        max={256}
+                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                        placeholder="Max length"
+                        value={clipMaxLength}
+                        onChange={(e) => setClipMaxLength(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex items-center gap-2">
+                    <button
+                      type="button"
+                      className="rounded-md bg-violet-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-violet-500"
+                      disabled={isClipSaving}
+                      onClick={() => {
+                        void saveClipConfig();
+                      }}
+                    >
+                      {isClipSaving ? "Guardando..." : "Guardar CLIP"}
+                    </button>
+
+                    {clipStatus?.configured && (
+                      <span className={`text-[11px] ${clipStatus.enabled ? "text-emerald-300" : "text-amber-300"}`}>
+                        {clipStatus.enabled ? "CLIP activo" : "CLIP inactivo"}
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
