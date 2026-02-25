@@ -107,6 +107,9 @@ function App() {
   const [isQuickLookOpen, setIsQuickLookOpen] = useState(false);
   const [quickLookTextPreview, setQuickLookTextPreview] = useState<FileTextPreview | null>(null);
   const [quickLookMode, setQuickLookMode] = useState<"visual" | "text">("visual");
+  const [quickLookVisualLoaded, setQuickLookVisualLoaded] = useState(false);
+  const [quickLookVisualFailed, setQuickLookVisualFailed] = useState(false);
+  const [searchModeBadge, setSearchModeBadge] = useState<"LOCAL" | "CLOUD" | null>(null);
 
   useEffect(() => {
     const loadStatus = async () => {
@@ -254,6 +257,7 @@ function App() {
       const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
 
       let response: SearchResultItem[] = [];
+      let semanticCommandOk = false;
 
       try {
         response = await invoke<SearchResultItem[]>("semantic_search", {
@@ -264,6 +268,7 @@ function App() {
           excludedFolders: excludedFolderRules,
           maxFileSizeMb: maxSizeValue,
         });
+        semanticCommandOk = true;
       } catch {
         response = await invoke<SearchResultItem[]>("search_stub", {
           query: cleanQuery,
@@ -277,10 +282,15 @@ function App() {
       setResults(response);
       setSelectedIndex(response.length > 0 ? 0 : -1);
       setQuickLookPath(response.length > 0 ? response[0].path : null);
+
+      const hasSemanticSnippet = response.some((item) => item.snippet.toLowerCase().startsWith("semántico"));
+      const isCloud = semanticCommandOk && hasSemanticSnippet && Boolean(aiProviderStatus?.configured);
+      setSearchModeBadge(isCloud ? "CLOUD" : "LOCAL");
     } catch {
       setResults([]);
       setSelectedIndex(-1);
       setQuickLookPath(null);
+      setSearchModeBadge(null);
       setErrorMessage("No se pudo ejecutar la búsqueda local.");
     } finally {
       setIsLoading(false);
@@ -599,6 +609,25 @@ function App() {
     };
   }, [quickLookItem?.path, isQuickLookOpen]);
 
+  useEffect(() => {
+    if (!isQuickLookOpen || quickLookMode !== "visual" || quickLookVisualLoaded || quickLookVisualFailed) {
+      return;
+    }
+
+    if (quickLookExt !== "pdf") {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      if (!quickLookVisualLoaded && quickLookTextPreview?.available) {
+        setQuickLookVisualFailed(true);
+        setQuickLookMode("text");
+      }
+    }, 2600);
+
+    return () => clearTimeout(timeout);
+  }, [isQuickLookOpen, quickLookMode, quickLookExt, quickLookVisualLoaded, quickLookVisualFailed, quickLookTextPreview?.available]);
+
   return (
     <div
       className="min-h-screen w-full bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-[#0a0b0f] via-[#020203] to-[#010101] flex flex-col items-center justify-start px-5 pb-5 pt-8"
@@ -852,6 +881,19 @@ function App() {
             }}
             autoFocus
           />
+
+          {searchModeBadge && (
+            <span
+              className={`mr-1 rounded-md px-2 py-1 text-[10px] font-medium ${
+                searchModeBadge === "CLOUD"
+                  ? "bg-indigo-500/20 text-indigo-300 ring-1 ring-indigo-400/30"
+                  : "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30"
+              }`}
+              title={searchModeBadge === "CLOUD" ? "Resultados con embeddings API" : "Resultados locales"}
+            >
+              {searchModeBadge}
+            </span>
+          )}
         </div>
 
         {isLoading && (
@@ -911,6 +953,8 @@ function App() {
                     className="inline-flex items-center gap-1 rounded-md bg-white/5 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:bg-white/15"
                     onClick={() => {
                       setQuickLookPath(item.path);
+                      setQuickLookVisualLoaded(false);
+                      setQuickLookVisualFailed(false);
                       const lower = item.path.toLowerCase();
                       const ext = lower.includes(".") ? lower.slice(lower.lastIndexOf(".") + 1) : "";
                       const visual = ["pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff"].includes(ext);
@@ -1159,7 +1203,7 @@ function App() {
 
         {isQuickLookOpen && quickLookItem && (
           <div
-            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+            className="fixed inset-0 z-60 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
             onClick={() => setIsQuickLookOpen(false)}
           >
             <div
@@ -1175,6 +1219,10 @@ function App() {
                       {quickLookImageMeta.format ?? quickLookExt.toUpperCase()} · {quickLookImageMeta.width ?? "?"}x{quickLookImageMeta.height ?? "?"}
                       {quickLookImageMeta.date_taken ? ` · ${quickLookImageMeta.date_taken}` : ""}
                     </p>
+                  )}
+
+                  {quickLookVisualFailed && (
+                    <p className="mt-1 text-[10px] text-amber-300">Render visual falló; cambiamos automáticamente a vista textual.</p>
                   )}
                 </div>
                 <div className="flex items-center gap-2">
@@ -1210,11 +1258,28 @@ function App() {
 
               <div className="mt-3 h-[68vh] overflow-hidden rounded-md bg-black/30 ring-1 ring-white/10">
                 {quickLookMode === "visual" && isQuickLookImage && quickLookUrl && (
-                  <img src={quickLookUrl} alt={quickLookItem.title} className="h-full w-full object-contain" loading="lazy" />
+                  <img
+                    src={quickLookUrl}
+                    alt={quickLookItem.title}
+                    className="h-full w-full object-contain"
+                    loading="lazy"
+                    onLoad={() => setQuickLookVisualLoaded(true)}
+                    onError={() => {
+                      setQuickLookVisualFailed(true);
+                      if (quickLookTextPreview?.available) {
+                        setQuickLookMode("text");
+                      }
+                    }}
+                  />
                 )}
 
                 {quickLookMode === "visual" && quickLookExt === "pdf" && quickLookUrl && (
-                  <iframe title={`quicklook-modal-${quickLookItem.path}`} src={quickLookUrl} className="h-full w-full border-0" />
+                  <iframe
+                    title={`quicklook-modal-${quickLookItem.path}`}
+                    src={quickLookUrl}
+                    className="h-full w-full border-0"
+                    onLoad={() => setQuickLookVisualLoaded(true)}
+                  />
                 )}
 
                 {quickLookMode === "visual" && !hasVisualPreview && (
