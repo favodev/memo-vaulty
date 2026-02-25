@@ -48,6 +48,8 @@ struct SearchResultItem {
     title: String,
     path: String,
     snippet: String,
+    match_reason: String,
+    origin: String,
 }
 
 #[derive(Serialize)]
@@ -452,6 +454,7 @@ async fn semantic_search(
     excluded_extensions: Option<Vec<String>>,
     excluded_folders: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
+    images_only: Option<bool>,
 ) -> Result<Vec<SearchResultItem>, String> {
     let clean_query = query.trim();
     if clean_query.is_empty() {
@@ -462,6 +465,7 @@ async fn semantic_search(
     let exclusions = normalize_extensions(excluded_extensions);
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
+    let images_only = images_only.unwrap_or(false);
 
     let mut candidates = match load_chunk_candidates_from_lancedb(
         &app,
@@ -471,6 +475,7 @@ async fn semantic_search(
         &folder_exclusions,
         max_file_size_bytes,
         80,
+        images_only,
     )
     .await
     {
@@ -483,6 +488,7 @@ async fn semantic_search(
             &folder_exclusions,
             max_file_size_bytes,
             80,
+            images_only,
         )?,
     };
 
@@ -522,14 +528,26 @@ async fn semantic_search(
             let results = scored
                 .into_iter()
                 .take(max_results)
-                .map(|(score, item)| SearchResultItem {
-                    title: item.title,
-                    path: item.path,
-                    snippet: format!(
-                        "Semántico {:.2} · {}",
-                        score,
-                        build_chunk_snippet(&item.chunk_text, clean_query)
-                    ),
+                .map(|(score, item)| {
+                    let path = item.path;
+                    let title = item.title;
+                    let chunk_text = item.chunk_text;
+
+                    SearchResultItem {
+                        title,
+                        path: path.clone(),
+                        snippet: format!(
+                            "Semántico {:.2} · {}",
+                            score,
+                            build_chunk_snippet(&chunk_text, clean_query)
+                        ),
+                        match_reason: format!(
+                            "{} (score {:.2}).",
+                            semantic_reason_for_path(&path, "Similaridad semántica alta con la consulta"),
+                            score,
+                        ),
+                        origin: "cloud-semantic".to_string(),
+                    }
                 })
                 .collect();
 
@@ -539,14 +557,27 @@ async fn semantic_search(
 
     let mut lexical = candidates
         .into_iter()
-        .map(|item| SearchResultItem {
-            title: item.title,
-            path: item.path,
-            snippet: format!(
-                "Léxico {:.2} · {}",
-                item.lexical_score,
-                build_chunk_snippet(&item.chunk_text, clean_query)
-            ),
+        .map(|item| {
+            let path = item.path;
+            let title = item.title;
+            let chunk_text = item.chunk_text;
+            let lexical_score = item.lexical_score;
+
+            SearchResultItem {
+                title,
+                path: path.clone(),
+                snippet: format!(
+                    "Léxico {:.2} · {}",
+                    lexical_score,
+                    build_chunk_snippet(&chunk_text, clean_query)
+                ),
+                match_reason: format!(
+                    "{} (score {:.2}).",
+                    lexical_reason_for_path(&path, "Coincidencia léxica local en chunks indexados"),
+                    lexical_score
+                ),
+                origin: "local-lexical".to_string(),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -614,6 +645,7 @@ fn search_stub(
     excluded_extensions: Option<Vec<String>>,
     excluded_folders: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
+    images_only: Option<bool>,
 ) -> Vec<SearchResultItem> {
     let clean_query = query.trim();
 
@@ -625,6 +657,7 @@ fn search_stub(
     let exclusions = normalize_extensions(excluded_extensions);
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
+    let images_only = images_only.unwrap_or(false);
 
     if let Ok(db_results) = search_in_chunk_db(
         &app,
@@ -634,6 +667,7 @@ fn search_stub(
         &folder_exclusions,
         max_file_size_bytes,
         30,
+        images_only,
     ) {
         if !db_results.is_empty() {
             return db_results;
@@ -647,6 +681,7 @@ fn search_stub(
         &exclusions,
         &folder_exclusions,
         max_file_size_bytes,
+        images_only,
     ) {
         return index_results;
     }
@@ -657,6 +692,7 @@ fn search_stub(
         &exclusions,
         &folder_exclusions,
         max_file_size_bytes,
+        images_only,
     )
 }
 
@@ -971,6 +1007,7 @@ fn search_in_index(
     excluded_extensions: &[String],
     excluded_folders: &[String],
     max_file_size_bytes: u64,
+    images_only: bool,
 ) -> Option<Vec<SearchResultItem>> {
     const MAX_RESULTS: usize = 30;
 
@@ -1006,6 +1043,10 @@ fn search_in_index(
             continue;
         }
 
+        if images_only && !is_image_path(&path) {
+            continue;
+        }
+
         let is_match = query_tokens
             .iter()
             .all(|token| item.search_key.contains(token));
@@ -1018,6 +1059,12 @@ fn search_in_index(
             title: item.title.clone(),
             path: item.path.clone(),
             snippet: build_index_snippet(item, &query_tokens),
+            match_reason: if is_image_path(&path) {
+                "Coincidencia de tokens sobre metadata de imagen indexada localmente.".to_string()
+            } else {
+                "Coincidencia de tokens en índice local persistente.".to_string()
+            },
+            origin: "local-index".to_string(),
         });
     }
 
@@ -1030,6 +1077,7 @@ fn search_local_files(
     excluded_extensions: &[String],
     excluded_folders: &[String],
     max_file_size_bytes: u64,
+    images_only: bool,
 ) -> Vec<SearchResultItem> {
     const MAX_RESULTS: usize = 30;
     const MAX_DEPTH: usize = 8;
@@ -1093,6 +1141,10 @@ fn search_local_files(
                 continue;
             }
 
+            if images_only && !is_image_path(&path) {
+                continue;
+            }
+
             if is_excluded_file(&path, excluded_extensions) {
                 continue;
             }
@@ -1125,6 +1177,8 @@ fn search_local_files(
                 title: file_name.to_string(),
                 path: path.to_string_lossy().to_string(),
                 snippet: "Coincidencia por nombre de archivo (búsqueda local inicial).".to_string(),
+                match_reason: "El nombre del archivo contiene todos los términos de búsqueda.".to_string(),
+                origin: "local-filename".to_string(),
             });
         }
 
@@ -1541,6 +1595,24 @@ fn is_image_extension(ext: &str) -> bool {
     matches!(ext, "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff")
 }
 
+fn semantic_reason_for_path(path: &str, base: &str) -> String {
+    let path_buf = PathBuf::from(path);
+    if is_image_path(&path_buf) {
+        format!("{} sobre metadata de imagen", base)
+    } else {
+        base.to_string()
+    }
+}
+
+fn lexical_reason_for_path(path: &str, base: &str) -> String {
+    let path_buf = PathBuf::from(path);
+    if is_image_path(&path_buf) {
+        format!("{} sobre metadata de imagen", base)
+    } else {
+        base.to_string()
+    }
+}
+
 fn extract_pdf_text(path: &Path) -> Option<(String, bool)> {
     let primary = std::panic::catch_unwind(|| pdf_extract::extract_text(path))
         .ok()
@@ -1841,6 +1913,7 @@ fn search_in_chunk_db(
     excluded_folders: &[String],
     max_file_size_bytes: u64,
     max_results: usize,
+    images_only: bool,
 ) -> Result<Vec<SearchResultItem>, String> {
     let candidates = load_chunk_candidates(
         app,
@@ -1850,15 +1923,29 @@ fn search_in_chunk_db(
         excluded_folders,
         max_file_size_bytes,
         max_results,
+        images_only,
     )?;
 
     Ok(candidates
         .into_iter()
         .take(max_results)
-        .map(|item| SearchResultItem {
-            title: item.title,
-            path: item.path,
-            snippet: build_chunk_snippet(&item.chunk_text, query),
+        .map(|item| {
+            let path = item.path;
+            let title = item.title;
+            let chunk_text = item.chunk_text;
+            let lexical_score = item.lexical_score;
+
+            SearchResultItem {
+                title,
+                path: path.clone(),
+                snippet: build_chunk_snippet(&chunk_text, query),
+                match_reason: format!(
+                    "{} (score {:.2}).",
+                    lexical_reason_for_path(&path, "Coincidencia léxica local en contenido indexado"),
+                    lexical_score
+                ),
+                origin: "local-chunk".to_string(),
+            }
         })
         .collect())
 }
@@ -1871,6 +1958,7 @@ fn load_chunk_candidates(
     excluded_folders: &[String],
     max_file_size_bytes: u64,
     max_results: usize,
+    images_only: bool,
 ) -> Result<Vec<ChunkCandidate>, String> {
     let tokens = tokenize_query(query);
     if tokens.is_empty() {
@@ -1935,6 +2023,10 @@ fn load_chunk_candidates(
             continue;
         }
 
+        if images_only && !is_image_path(&path_buf) {
+            continue;
+        }
+
         let mut hits = 0f32;
         for token in &tokens {
             if search_key.contains(token) {
@@ -1980,6 +2072,7 @@ async fn load_chunk_candidates_from_lancedb(
     excluded_folders: &[String],
     max_file_size_bytes: u64,
     max_results: usize,
+    images_only: bool,
 ) -> Result<Vec<ChunkCandidate>, String> {
     let tokens = tokenize_query(query);
     if tokens.is_empty() {
@@ -2072,6 +2165,10 @@ async fn load_chunk_candidates_from_lancedb(
                 || should_skip_custom_dir(&path_buf, excluded_folders)
                 || is_excluded_file(&path_buf, excluded_extensions)
             {
+                continue;
+            }
+
+            if images_only && !is_image_path(&path_buf) {
                 continue;
             }
 

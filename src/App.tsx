@@ -9,6 +9,8 @@ type SearchResultItem = {
   title: string;
   path: string;
   snippet: string;
+  match_reason?: string;
+  origin?: string;
 };
 
 type IndexStatus = {
@@ -102,6 +104,7 @@ function App() {
   const [isSavingAi, setIsSavingAi] = useState(false);
   const [watcherStatus, setWatcherStatus] = useState<FileWatcherStatus | null>(null);
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
+  const [imagesOnly, setImagesOnly] = useState(false);
   const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
   const [quickLookImageMeta, setQuickLookImageMeta] = useState<ImageMetadata | null>(null);
   const [isQuickLookOpen, setIsQuickLookOpen] = useState(false);
@@ -267,6 +270,7 @@ function App() {
           excludedExtensions: exclusions,
           excludedFolders: excludedFolderRules,
           maxFileSizeMb: maxSizeValue,
+          imagesOnly,
         });
         semanticCommandOk = true;
       } catch {
@@ -276,6 +280,7 @@ function App() {
           excludedExtensions: exclusions,
           excludedFolders: excludedFolderRules,
           maxFileSizeMb: maxSizeValue,
+          imagesOnly,
         });
       }
 
@@ -283,8 +288,8 @@ function App() {
       setSelectedIndex(response.length > 0 ? 0 : -1);
       setQuickLookPath(response.length > 0 ? response[0].path : null);
 
-      const hasSemanticSnippet = response.some((item) => item.snippet.toLowerCase().startsWith("semántico"));
-      const isCloud = semanticCommandOk && hasSemanticSnippet && Boolean(aiProviderStatus?.configured);
+      const hasCloudSemantic = response.some((item) => item.origin === "cloud-semantic");
+      const isCloud = semanticCommandOk && hasCloudSemantic && Boolean(aiProviderStatus?.configured);
       setSearchModeBadge(isCloud ? "CLOUD" : "LOCAL");
     } catch {
       setResults([]);
@@ -882,6 +887,19 @@ function App() {
             autoFocus
           />
 
+          <button
+            type="button"
+            className={`shrink-0 rounded-md px-2 py-1 text-[10px] font-medium transition-colors ${
+              imagesOnly
+                ? "bg-fuchsia-500/20 text-fuchsia-300 ring-1 ring-fuchsia-400/30"
+                : "bg-white/10 text-gray-300 hover:bg-white/20"
+            }`}
+            onClick={() => setImagesOnly((value) => !value)}
+            title="Limitar búsqueda a imágenes"
+          >
+            Solo imágenes
+          </button>
+
           {searchModeBadge && (
             <span
               className={`mr-1 rounded-md px-2 py-1 text-[10px] font-medium ${
@@ -928,6 +946,22 @@ function App() {
               >
                 <p className="text-sm font-medium text-white">{renderHighlighted(item.title)}</p>
                 <p className="mt-1 text-xs text-gray-400">{renderHighlighted(item.snippet)}</p>
+                {item.match_reason && (
+                  <div className="mt-1 flex items-center gap-2">
+                    <span
+                      className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
+                        item.origin === "cloud-semantic"
+                          ? "bg-indigo-500/15 text-indigo-300 ring-indigo-400/30"
+                          : "bg-emerald-500/15 text-emerald-300 ring-emerald-400/30"
+                      }`}
+                    >
+                      {item.origin === "cloud-semantic" ? "CLOUD" : "LOCAL"}
+                    </span>
+                    <p className="truncate text-[11px] text-gray-500" title={item.match_reason}>
+                      {renderHighlighted(item.match_reason)}
+                    </p>
+                  </div>
+                )}
                 <p className="mt-1 text-[11px] text-gray-500 truncate">{item.path}</p>
                 <div className="mt-2 flex items-center gap-2">
                   <button
@@ -1305,6 +1339,9 @@ function App() {
               </div>
 
               <p className="mt-2 text-[11px] text-gray-500">Snippet: {quickLookItem.snippet}</p>
+              {quickLookItem.match_reason && (
+                <p className="mt-1 text-[11px] text-gray-500">Por qué apareció: {quickLookItem.match_reason}</p>
+              )}
             </div>
           </div>
         )}
