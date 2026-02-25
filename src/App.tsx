@@ -52,6 +52,8 @@ type AiProviderStatus = {
   provider: string;
   base_url: string;
   embedding_model: string;
+  chat_base_url: string;
+  chat_model: string;
   api_key_hint: string | null;
 };
 
@@ -90,6 +92,17 @@ type RagSourceItem = {
 type RagAnswerResponse = {
   answer: string;
   grounded: boolean;
+  mode: string;
+  sources: RagSourceItem[];
+};
+
+type ChatHistoryItem = {
+  id: string;
+  timestamp: string;
+  query: string;
+  answer: string;
+  grounded: boolean;
+  mode: string;
   sources: RagSourceItem[];
 };
 
@@ -114,6 +127,8 @@ function App() {
   const [aiApiKey, setAiApiKey] = useState("");
   const [aiModel, setAiModel] = useState("text-embedding-3-small");
   const [aiBaseUrl, setAiBaseUrl] = useState("https://openrouter.ai/api/v1/embeddings");
+  const [aiChatModel, setAiChatModel] = useState("gpt-4o-mini");
+  const [aiChatBaseUrl, setAiChatBaseUrl] = useState("https://openrouter.ai/api/v1/chat/completions");
   const [isSavingAi, setIsSavingAi] = useState(false);
   const [watcherStatus, setWatcherStatus] = useState<FileWatcherStatus | null>(null);
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
@@ -129,6 +144,9 @@ function App() {
   const [searchModeBadge, setSearchModeBadge] = useState<"LOCAL" | "CLOUD" | null>(null);
   const [isRagLoading, setIsRagLoading] = useState(false);
   const [ragResponse, setRagResponse] = useState<RagAnswerResponse | null>(null);
+  const [answerMode, setAnswerMode] = useState<"auto" | "local" | "cloud">("auto");
+  const [chatHistory, setChatHistory] = useState<ChatHistoryItem[]>([]);
+  const [isChatHistoryLoading, setIsChatHistoryLoading] = useState(false);
 
   const refreshStatus = async () => {
     try {
@@ -150,6 +168,8 @@ function App() {
       setAiProviderStatus(status);
       setAiModel(status.embedding_model);
       setAiBaseUrl(status.base_url);
+      setAiChatModel(status.chat_model);
+      setAiChatBaseUrl(status.chat_base_url);
     } catch {
       setAiProviderStatus(null);
     }
@@ -164,7 +184,20 @@ function App() {
 
   useEffect(() => {
     void refreshStatus();
+    void refreshChatHistory();
   }, []);
+
+  const refreshChatHistory = async () => {
+    setIsChatHistoryLoading(true);
+    try {
+      const history = await invoke<ChatHistoryItem[]>("get_chat_history", { limit: 12 });
+      setChatHistory(history);
+    } catch {
+      setChatHistory([]);
+    } finally {
+      setIsChatHistoryLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (!watcherStatus?.running) {
@@ -349,13 +382,28 @@ function App() {
         excludedFolders: excludedFolderRules,
         maxFileSizeMb: maxSizeValue,
         topK: 4,
+        mode: answerMode,
       });
 
       setRagResponse(response);
+      await refreshChatHistory();
     } catch {
       setIndexFeedback({ type: "error", text: "No se pudo generar respuesta local" });
     } finally {
       setIsRagLoading(false);
+    }
+  };
+
+  const clearChatHistory = async () => {
+    setIsChatHistoryLoading(true);
+    try {
+      await invoke("clear_chat_history");
+      setChatHistory([]);
+      setIndexFeedback({ type: "success", text: "Historial de chat limpiado" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo limpiar historial" });
+    } finally {
+      setIsChatHistoryLoading(false);
     }
   };
 
@@ -584,6 +632,8 @@ function App() {
         apiKey: aiApiKey,
         embeddingModel: aiModel,
         baseUrl: aiBaseUrl,
+        chatModel: aiChatModel,
+        chatBaseUrl: aiChatBaseUrl,
       });
 
       setAiProviderStatus(status);
@@ -1083,6 +1133,33 @@ function App() {
             {isRagLoading ? "Respondiendo..." : "Responder"}
           </button>
 
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              className={`rounded-md px-2 py-1 text-[10px] ${answerMode === "auto" ? "bg-cyan-500/20 text-cyan-300 ring-1 ring-cyan-400/30" : "bg-white/10 text-gray-300 hover:bg-white/20"}`}
+              onClick={() => setAnswerMode("auto")}
+              title="AUTO: intenta cloud y cae a local"
+            >
+              AUTO
+            </button>
+            <button
+              type="button"
+              className={`rounded-md px-2 py-1 text-[10px] ${answerMode === "local" ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30" : "bg-white/10 text-gray-300 hover:bg-white/20"}`}
+              onClick={() => setAnswerMode("local")}
+              title="LOCAL: solo índice local"
+            >
+              LOCAL
+            </button>
+            <button
+              type="button"
+              className={`rounded-md px-2 py-1 text-[10px] ${answerMode === "cloud" ? "bg-indigo-500/20 text-indigo-300 ring-1 ring-indigo-400/30" : "bg-white/10 text-gray-300 hover:bg-white/20"}`}
+              onClick={() => setAnswerMode("cloud")}
+              title="CLOUD: usa proveedor de chat configurado"
+            >
+              CLOUD
+            </button>
+          </div>
+
           {searchModeBadge && (
             <span
               className={`mr-1 rounded-md px-2 py-1 text-[10px] font-medium ${
@@ -1113,15 +1190,26 @@ function App() {
           <div className="mt-5 rounded-xl bg-white/4 p-4 ring-1 ring-white/10">
             <div className="flex items-center justify-between gap-2">
               <p className="text-xs font-medium text-white">Respuesta con evidencia local</p>
-              <span
-                className={`rounded-md px-2 py-1 text-[10px] font-medium ${
-                  ragResponse.grounded
-                    ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30"
-                    : "bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/30"
-                }`}
-              >
-                {ragResponse.grounded ? "CON EVIDENCIA" : "SIN EVIDENCIA"}
-              </span>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`rounded-md px-2 py-1 text-[10px] font-medium ${
+                    ragResponse.mode === "cloud"
+                      ? "bg-indigo-500/20 text-indigo-300 ring-1 ring-indigo-400/30"
+                      : "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30"
+                  }`}
+                >
+                  {ragResponse.mode.toUpperCase()}
+                </span>
+                <span
+                  className={`rounded-md px-2 py-1 text-[10px] font-medium ${
+                    ragResponse.grounded
+                      ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30"
+                      : "bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/30"
+                  }`}
+                >
+                  {ragResponse.grounded ? "CON EVIDENCIA" : "SIN EVIDENCIA"}
+                </span>
+              </div>
             </div>
 
             <pre className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-gray-300">{ragResponse.answer}</pre>
@@ -1162,6 +1250,38 @@ function App() {
             )}
           </div>
         )}
+
+        <div className="mt-4 rounded-xl bg-white/4 p-4 ring-1 ring-white/10">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-medium text-white">Historial local de respuestas</p>
+            <button
+              type="button"
+              className="rounded-md bg-white/10 px-2 py-1 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
+              onClick={() => {
+                void clearChatHistory();
+              }}
+              disabled={isChatHistoryLoading}
+            >
+              Limpiar historial
+            </button>
+          </div>
+
+          {chatHistory.length === 0 ? (
+            <p className="mt-2 text-[11px] text-gray-500">Sin historial todavía.</p>
+          ) : (
+            <div className="mt-2 space-y-2">
+              {chatHistory.map((entry) => (
+                <div key={entry.id} className="rounded-md bg-white/5 p-2 ring-1 ring-white/10">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="truncate text-[11px] text-white">{entry.query}</p>
+                    <span className="rounded-md bg-white/10 px-1.5 py-0.5 text-[10px] text-gray-300">{entry.mode.toUpperCase()}</span>
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-[11px] text-gray-400">{entry.answer}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
 
         {!isLoading && results.length > 0 && (
           <div className="mt-5 max-h-[62vh] space-y-2 overflow-y-auto pr-1 pb-2">
@@ -1386,6 +1506,34 @@ function App() {
                         placeholder="https://openrouter.ai/api/v1/embeddings"
                         value={aiBaseUrl}
                         onChange={(e) => setAiBaseUrl(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-gray-500" htmlFor="ai-chat-model">
+                        Modelo de chat
+                      </label>
+                      <input
+                        id="ai-chat-model"
+                        type="text"
+                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                        placeholder="gpt-4o-mini"
+                        value={aiChatModel}
+                        onChange={(e) => setAiChatModel(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-gray-500" htmlFor="ai-chat-base-url">
+                        Endpoint chat
+                      </label>
+                      <input
+                        id="ai-chat-base-url"
+                        type="text"
+                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                        placeholder="https://openrouter.ai/api/v1/chat/completions"
+                        value={aiChatBaseUrl}
+                        onChange={(e) => setAiChatBaseUrl(e.target.value)}
                       />
                     </div>
                   </div>

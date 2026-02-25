@@ -69,7 +69,7 @@ struct FileTextPreview {
     text: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct RagSourceItem {
     title: String,
     path: String,
@@ -81,6 +81,18 @@ struct RagSourceItem {
 struct RagAnswerResponse {
     answer: String,
     grounded: bool,
+    mode: String,
+    sources: Vec<RagSourceItem>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ChatHistoryItem {
+    id: String,
+    timestamp: String,
+    query: String,
+    answer: String,
+    grounded: bool,
+    mode: String,
     sources: Vec<RagSourceItem>,
 }
 
@@ -220,6 +232,8 @@ struct AiProviderConfig {
     provider: String,
     base_url: String,
     embedding_model: String,
+    chat_base_url: String,
+    chat_model: String,
     api_key: String,
 }
 
@@ -229,6 +243,8 @@ struct AiProviderStatus {
     provider: String,
     base_url: String,
     embedding_model: String,
+    chat_base_url: String,
+    chat_model: String,
     api_key_hint: Option<String>,
 }
 
@@ -258,6 +274,21 @@ struct EmbeddingResponse {
 #[derive(Deserialize)]
 struct EmbeddingDataItem {
     embedding: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<ChatChoiceItem>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoiceItem {
+    message: ChatMessageItem,
+}
+
+#[derive(Deserialize)]
+struct ChatMessageItem {
+    content: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -430,6 +461,8 @@ fn configure_ai_provider(
     api_key: String,
     embedding_model: Option<String>,
     base_url: Option<String>,
+    chat_model: Option<String>,
+    chat_base_url: Option<String>,
 ) -> Result<AiProviderStatus, String> {
     let trimmed_key = api_key.trim().to_string();
     if trimmed_key.is_empty() {
@@ -444,6 +477,14 @@ fn configure_ai_provider(
             .to_string(),
         embedding_model: embedding_model
             .unwrap_or_else(|| "text-embedding-3-small".to_string())
+            .trim()
+            .to_string(),
+        chat_base_url: chat_base_url
+            .unwrap_or_else(|| "https://openrouter.ai/api/v1/chat/completions".to_string())
+            .trim()
+            .to_string(),
+        chat_model: chat_model
+            .unwrap_or_else(|| "gpt-4o-mini".to_string())
             .trim()
             .to_string(),
         api_key: trimmed_key,
@@ -613,21 +654,34 @@ async fn semantic_search(
 #[tauri::command]
 async fn answer_with_local_context(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     query: String,
     roots: Option<Vec<String>>,
     excluded_extensions: Option<Vec<String>>,
     excluded_folders: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
     top_k: Option<usize>,
+    mode: Option<String>,
 ) -> Result<RagAnswerResponse, String> {
     let clean_query = query.trim();
     if clean_query.is_empty() {
         return Ok(RagAnswerResponse {
             answer: "Escribe una consulta para poder responder con evidencia local.".to_string(),
             grounded: false,
+            mode: "local".to_string(),
             sources: Vec::new(),
         });
     }
+
+    let requested_mode = mode
+        .unwrap_or_else(|| "auto".to_string())
+        .trim()
+        .to_lowercase();
+    let requested_mode = if requested_mode == "cloud" || requested_mode == "local" || requested_mode == "auto" {
+        requested_mode
+    } else {
+        "auto".to_string()
+    };
 
     let search_roots = resolve_roots(roots);
     let exclusions = normalize_extensions(excluded_extensions);
@@ -661,11 +715,27 @@ async fn answer_with_local_context(
     };
 
     if candidates.is_empty() {
-        return Ok(RagAnswerResponse {
+        let response = RagAnswerResponse {
             answer: "No tengo evidencia suficiente en tu índice local para responder esta consulta. Prueba reindexar o cambiar términos.".to_string(),
             grounded: false,
+            mode: "local".to_string(),
             sources: Vec::new(),
-        });
+        };
+
+        let _ = append_chat_history(
+            &app,
+            &ChatHistoryItem {
+                id: now_millis_string(),
+                timestamp: now_timestamp_string(),
+                query: clean_query.to_string(),
+                answer: response.answer.clone(),
+                grounded: false,
+                mode: response.mode.clone(),
+                sources: Vec::new(),
+            },
+        );
+
+        return Ok(response);
     }
 
     let selected = candidates
@@ -683,13 +753,104 @@ async fn answer_with_local_context(
         })
         .collect::<Vec<_>>();
 
-    let answer = build_local_grounded_answer(clean_query, &selected);
+    let local_answer = build_local_grounded_answer(clean_query, &selected);
 
-    Ok(RagAnswerResponse {
-        answer,
+    let ai_cfg = state
+        .ai_config
+        .lock()
+        .ok()
+        .and_then(|value| value.as_ref().cloned());
+
+    let mut final_answer = local_answer.clone();
+    let mut used_mode = "local".to_string();
+
+    let should_try_cloud = requested_mode == "cloud" || requested_mode == "auto";
+
+    if should_try_cloud {
+        if let Some(config) = ai_cfg {
+            let context = selected
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    format!(
+                        "[Fuente {}] {}\nRuta: {}\nContenido: {}",
+                        index + 1,
+                        item.title,
+                        item.path,
+                        normalize_text_for_index(&item.chunk_text, 900)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            match request_chat_answer(&config, clean_query, &context).await {
+                Ok(answer) if !answer.trim().is_empty() => {
+                    final_answer = answer;
+                    used_mode = "cloud".to_string();
+                }
+                Ok(_) => {
+                    if requested_mode == "cloud" {
+                        final_answer = format!(
+                            "El proveedor cloud no devolvió contenido útil. Fallback local:\n{}",
+                            local_answer
+                        );
+                    }
+                }
+                Err(err) => {
+                    if requested_mode == "cloud" {
+                        final_answer = format!(
+                            "No se pudo responder en modo cloud ({err}). Fallback local:\n{}",
+                            local_answer
+                        );
+                    }
+                }
+            }
+        } else if requested_mode == "cloud" {
+            final_answer = format!(
+                "No hay proveedor cloud configurado; se usa fallback local.\n{}",
+                local_answer
+            );
+        }
+    }
+
+    let response = RagAnswerResponse {
+        answer: final_answer,
         grounded: true,
+        mode: used_mode,
         sources,
-    })
+    };
+
+    let _ = append_chat_history(
+        &app,
+        &ChatHistoryItem {
+            id: now_millis_string(),
+            timestamp: now_timestamp_string(),
+            query: clean_query.to_string(),
+            answer: response.answer.clone(),
+            grounded: response.grounded,
+            mode: response.mode.clone(),
+            sources: response.sources.clone(),
+        },
+    );
+
+    Ok(response)
+}
+
+#[tauri::command]
+fn get_chat_history(app: tauri::AppHandle, limit: Option<usize>) -> Result<Vec<ChatHistoryItem>, String> {
+    let history = load_chat_history(&app).unwrap_or_default();
+    let max = limit.unwrap_or(20).clamp(1, 100);
+    Ok(history
+        .into_iter()
+        .rev()
+        .take(max)
+        .collect::<Vec<_>>())
+}
+
+#[tauri::command]
+fn clear_chat_history(app: tauri::AppHandle) -> Result<(), String> {
+    let path = chat_history_path(&app).ok_or_else(|| "No se pudo resolver ruta de historial".to_string())?;
+    fs::write(path, "[]").map_err(|err| format!("No se pudo limpiar historial: {err}"))
 }
 
 #[tauri::command]
@@ -2611,6 +2772,8 @@ fn ai_provider_status_from_config(config: Option<&AiProviderConfig>) -> AiProvid
             provider: cfg.provider.clone(),
             base_url: cfg.base_url.clone(),
             embedding_model: cfg.embedding_model.clone(),
+            chat_base_url: cfg.chat_base_url.clone(),
+            chat_model: cfg.chat_model.clone(),
             api_key_hint: Some(mask_api_key(&cfg.api_key)),
         };
     }
@@ -2620,6 +2783,8 @@ fn ai_provider_status_from_config(config: Option<&AiProviderConfig>) -> AiProvid
         provider: "openrouter-compatible".to_string(),
         base_url: "https://openrouter.ai/api/v1/embeddings".to_string(),
         embedding_model: "text-embedding-3-small".to_string(),
+        chat_base_url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+        chat_model: "gpt-4o-mini".to_string(),
         api_key_hint: None,
     }
 }
@@ -2671,6 +2836,104 @@ async fn request_embeddings(config: &AiProviderConfig, input: &[String]) -> Resu
         .into_iter()
         .map(|item| item.embedding)
         .collect())
+}
+
+async fn request_chat_answer(config: &AiProviderConfig, query: &str, context: &str) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "model": config.chat_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Responde solo con base en el contexto proporcionado. Si falta evidencia, dilo explícitamente. Sé breve y preciso."
+            },
+            {
+                "role": "user",
+                "content": format!("Consulta: {}\n\nContexto:\n{}", query, context)
+            }
+        ]
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&config.chat_base_url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("No se pudo llamar API de chat: {err}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Chat respondió {}: {}",
+            status.as_u16(),
+            body.chars().take(220).collect::<String>()
+        ));
+    }
+
+    let parsed = response
+        .json::<ChatCompletionResponse>()
+        .await
+        .map_err(|err| format!("Respuesta de chat inválida: {err}"))?;
+
+    let Some(choice) = parsed.choices.into_iter().next() else {
+        return Err("Chat no devolvió opciones".to_string());
+    };
+
+    extract_chat_content(&choice.message.content)
+}
+
+fn extract_chat_content(value: &serde_json::Value) -> Result<String, String> {
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_string());
+    }
+
+    if let Some(parts) = value.as_array() {
+        let joined = parts
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|text| text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if !joined.trim().is_empty() {
+            return Ok(joined);
+        }
+    }
+
+    Err("Contenido de chat no soportado".to_string())
+}
+
+fn chat_history_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("chat-history.json");
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    Some(path)
+}
+
+fn load_chat_history(app: &tauri::AppHandle) -> Option<Vec<ChatHistoryItem>> {
+    let path = chat_history_path(app)?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Vec<ChatHistoryItem>>(&content).ok()
+}
+
+fn append_chat_history(app: &tauri::AppHandle, item: &ChatHistoryItem) -> Result<(), String> {
+    let mut history = load_chat_history(app).unwrap_or_default();
+    history.push(item.clone());
+
+    if history.len() > 300 {
+        let keep_from = history.len().saturating_sub(300);
+        history = history.into_iter().skip(keep_from).collect();
+    }
+
+    let path = chat_history_path(app).ok_or_else(|| "No se pudo resolver ruta de historial".to_string())?;
+    let serialized = serde_json::to_string(&history)
+        .map_err(|err| format!("No se pudo serializar historial: {err}"))?;
+    fs::write(path, serialized).map_err(|err| format!("No se pudo guardar historial: {err}"))
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
@@ -2844,6 +3107,13 @@ fn now_timestamp_string() -> String {
     }
 }
 
+fn now_millis_string() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => format!("{}", duration.as_millis()),
+        Err(_) => "0".to_string(),
+    }
+}
+
 fn index_cache_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     let path = app.path().app_data_dir().ok()?.join("index-cache.json");
 
@@ -2919,7 +3189,9 @@ pub fn run() {
             forget_index_root,
             export_app_config_to_file,
             import_app_config_from_file,
-            answer_with_local_context
+            answer_with_local_context,
+            get_chat_history,
+            clear_chat_history
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
