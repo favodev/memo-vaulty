@@ -69,6 +69,21 @@ struct FileTextPreview {
     text: String,
 }
 
+#[derive(Serialize)]
+struct RagSourceItem {
+    title: String,
+    path: String,
+    snippet: String,
+    score: f32,
+}
+
+#[derive(Serialize)]
+struct RagAnswerResponse {
+    answer: String,
+    grounded: bool,
+    sources: Vec<RagSourceItem>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct IndexedFileItem {
     title: String,
@@ -215,6 +230,16 @@ struct AiProviderStatus {
     base_url: String,
     embedding_model: String,
     api_key_hint: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ExportableAppConfig {
+    version: u32,
+    roots: Vec<String>,
+    excluded_extensions: Vec<String>,
+    excluded_folders: Vec<String>,
+    max_file_size_mb: u64,
+    ai_provider: Option<AiProviderConfig>,
 }
 
 #[derive(Clone)]
@@ -586,33 +611,238 @@ async fn semantic_search(
 }
 
 #[tauri::command]
-fn get_index_status(state: State<'_, AppState>) -> IndexStatus {
-    let guard = match state.index.lock() {
-        Ok(value) => value,
-        Err(_) => {
-            return IndexStatus {
-                has_index: false,
-                indexed_files: 0,
-                indexed_at: None,
-                roots: Vec::new(),
-            }
-        }
-    };
-
-    if let Some(snapshot) = guard.as_ref() {
-        return IndexStatus {
-            has_index: true,
-            indexed_files: snapshot.files.len(),
-            indexed_at: Some(snapshot.indexed_at.clone()),
-            roots: snapshot.roots.clone(),
-        };
+async fn answer_with_local_context(
+    app: tauri::AppHandle,
+    query: String,
+    roots: Option<Vec<String>>,
+    excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+    top_k: Option<usize>,
+) -> Result<RagAnswerResponse, String> {
+    let clean_query = query.trim();
+    if clean_query.is_empty() {
+        return Ok(RagAnswerResponse {
+            answer: "Escribe una consulta para poder responder con evidencia local.".to_string(),
+            grounded: false,
+            sources: Vec::new(),
+        });
     }
 
-    IndexStatus {
-        has_index: false,
-        indexed_files: 0,
-        indexed_at: None,
-        roots: Vec::new(),
+    let search_roots = resolve_roots(roots);
+    let exclusions = normalize_extensions(excluded_extensions);
+    let folder_exclusions = normalize_folder_rules(excluded_folders);
+    let max_file_size_bytes = max_size_bytes(max_file_size_mb);
+    let max_sources = top_k.unwrap_or(4).clamp(1, 8);
+
+    let candidates = match load_chunk_candidates_from_lancedb(
+        &app,
+        clean_query,
+        &search_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+        max_sources.saturating_mul(4).max(20),
+        false,
+    )
+    .await
+    {
+        Ok(value) if !value.is_empty() => value,
+        _ => load_chunk_candidates(
+            &app,
+            clean_query,
+            &search_roots,
+            &exclusions,
+            &folder_exclusions,
+            max_file_size_bytes,
+            max_sources.saturating_mul(4).max(20),
+            false,
+        )?,
+    };
+
+    if candidates.is_empty() {
+        return Ok(RagAnswerResponse {
+            answer: "No tengo evidencia suficiente en tu índice local para responder esta consulta. Prueba reindexar o cambiar términos.".to_string(),
+            grounded: false,
+            sources: Vec::new(),
+        });
+    }
+
+    let selected = candidates
+        .into_iter()
+        .take(max_sources)
+        .collect::<Vec<_>>();
+
+    let sources = selected
+        .iter()
+        .map(|item| RagSourceItem {
+            title: item.title.clone(),
+            path: item.path.clone(),
+            snippet: build_chunk_snippet(&item.chunk_text, clean_query),
+            score: item.lexical_score,
+        })
+        .collect::<Vec<_>>();
+
+    let answer = build_local_grounded_answer(clean_query, &selected);
+
+    Ok(RagAnswerResponse {
+        answer,
+        grounded: true,
+        sources,
+    })
+}
+
+#[tauri::command]
+fn get_index_status(state: State<'_, AppState>) -> IndexStatus {
+    current_index_status(state.inner())
+}
+
+#[tauri::command]
+fn clear_index_data(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<IndexStatus, String> {
+    clear_index_data_internal(&app, state.inner())
+}
+
+#[tauri::command]
+fn forget_index_root(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    root: String,
+    reindex: Option<bool>,
+) -> Result<IndexStatus, String> {
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return Err("Ruta de carpeta vacía".to_string());
+    }
+
+    let normalized = trimmed.to_lowercase();
+
+    let updated_settings = {
+        let mut settings = state
+            .index_settings
+            .lock()
+            .map_err(|_| "No se pudo actualizar configuración de indexado".to_string())?;
+
+        let before_len = settings.roots.len();
+        settings
+            .roots
+            .retain(|value| value.trim().to_lowercase() != normalized);
+
+        if settings.roots.len() == before_len {
+            return Err("La carpeta no estaba en la configuración actual".to_string());
+        }
+
+        settings.clone()
+    };
+
+    if updated_settings.roots.is_empty() {
+        return clear_index_data_internal(&app, state.inner());
+    }
+
+    if reindex.unwrap_or(true) {
+        execute_indexing(&app, state.inner(), updated_settings, "manual")
+    } else {
+        Ok(current_index_status(state.inner()))
+    }
+}
+
+#[tauri::command]
+fn export_app_config_to_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    include_secrets: Option<bool>,
+) -> Result<String, String> {
+    let settings = state
+        .index_settings
+        .lock()
+        .map_err(|_| "No se pudo leer configuración de indexado".to_string())?
+        .clone();
+
+    let include = include_secrets.unwrap_or(false);
+    let ai_provider = if include {
+        state
+            .ai_config
+            .lock()
+            .ok()
+            .and_then(|cfg| cfg.as_ref().cloned())
+    } else {
+        None
+    };
+
+    let payload = ExportableAppConfig {
+        version: 1,
+        roots: settings.roots,
+        excluded_extensions: settings.excluded_extensions,
+        excluded_folders: settings.excluded_folders,
+        max_file_size_mb: settings.max_file_size_mb,
+        ai_provider,
+    };
+
+    let serialized = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("No se pudo serializar configuración: {err}"))?;
+
+    let target = PathBuf::from(path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("No se pudo crear carpeta destino: {err}"))?;
+    }
+
+    fs::write(&target, serialized).map_err(|err| format!("No se pudo exportar configuración: {err}"))?;
+
+    let _ = app;
+    Ok(target.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn import_app_config_from_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    reindex: Option<bool>,
+) -> Result<IndexStatus, String> {
+    let source = PathBuf::from(path);
+    let content = fs::read_to_string(&source)
+        .map_err(|err| format!("No se pudo leer configuración importada: {err}"))?;
+
+    let parsed = serde_json::from_str::<ExportableAppConfig>(&content)
+        .map_err(|err| format!("JSON de configuración inválido: {err}"))?;
+
+    if parsed.version != 1 {
+        return Err("Versión de configuración no soportada".to_string());
+    }
+
+    let sanitized = IndexingSettings {
+        roots: parsed.roots,
+        excluded_extensions: parsed.excluded_extensions,
+        excluded_folders: parsed.excluded_folders,
+        max_file_size_mb: parsed.max_file_size_mb.max(1),
+    };
+
+    {
+        let mut settings = state
+            .index_settings
+            .lock()
+            .map_err(|_| "No se pudo aplicar configuración importada".to_string())?;
+        *settings = sanitized.clone();
+    }
+
+    if let Some(ai_cfg) = parsed.ai_provider {
+        if !ai_cfg.api_key.trim().is_empty() {
+            save_ai_provider_config(&app, &ai_cfg)?;
+            if let Ok(mut guard) = state.ai_config.lock() {
+                *guard = Some(ai_cfg);
+            }
+        }
+    }
+
+    if reindex.unwrap_or(true) {
+        if sanitized.roots.is_empty() {
+            return Ok(current_index_status(state.inner()));
+        }
+
+        execute_indexing(&app, state.inner(), sanitized, "manual")
+    } else {
+        Ok(current_index_status(state.inner()))
     }
 }
 
@@ -834,6 +1064,83 @@ fn execute_indexing(
 
     state.is_indexing.store(false, Ordering::SeqCst);
     result
+}
+
+fn current_index_status(state: &AppState) -> IndexStatus {
+    let guard = match state.index.lock() {
+        Ok(value) => value,
+        Err(_) => {
+            return IndexStatus {
+                has_index: false,
+                indexed_files: 0,
+                indexed_at: None,
+                roots: Vec::new(),
+            }
+        }
+    };
+
+    if let Some(snapshot) = guard.as_ref() {
+        return IndexStatus {
+            has_index: true,
+            indexed_files: snapshot.files.len(),
+            indexed_at: Some(snapshot.indexed_at.clone()),
+            roots: snapshot.roots.clone(),
+        };
+    }
+
+    IndexStatus {
+        has_index: false,
+        indexed_files: 0,
+        indexed_at: None,
+        roots: Vec::new(),
+    }
+}
+
+fn clear_index_data_internal(app: &tauri::AppHandle, state: &AppState) -> Result<IndexStatus, String> {
+    state.cancel_indexing.store(true, Ordering::SeqCst);
+
+    {
+        let mut index_guard = state
+            .index
+            .lock()
+            .map_err(|_| "No se pudo limpiar snapshot de índice".to_string())?;
+        *index_guard = None;
+    }
+
+    {
+        let mut diagnostics_guard = state
+            .diagnostics
+            .lock()
+            .map_err(|_| "No se pudo limpiar diagnóstico".to_string())?;
+        *diagnostics_guard = Some(IndexDiagnostics {
+            updated_at: Some(now_timestamp_string()),
+            ..IndexDiagnostics::default()
+        });
+    }
+
+    if let Ok(mut settings) = state.index_settings.lock() {
+        settings.roots.clear();
+    }
+
+    if let Ok(mut watcher) = state.watcher_status.lock() {
+        watcher.pending_events = false;
+        watcher.roots.clear();
+    }
+
+    if let Some(path) = index_cache_path(app) {
+        let _ = fs::remove_file(path);
+    }
+
+    if let Some(path) = semantic_db_path(app) {
+        let _ = fs::remove_file(path);
+    }
+
+    if let Some(path) = lancedb_dir_path(app) {
+        let _ = fs::remove_dir_all(&path);
+        let _ = fs::create_dir_all(&path);
+    }
+
+    Ok(current_index_status(state))
 }
 
 fn merge_indexing_settings(
@@ -2234,6 +2541,46 @@ fn build_chunk_snippet(content: &str, query: &str) -> String {
     format!("Coincidencia en chunk: {}", snippet)
 }
 
+fn build_local_grounded_answer(query: &str, candidates: &[ChunkCandidate]) -> String {
+    if candidates.is_empty() {
+        return "No tengo evidencia local suficiente para responder con confianza.".to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Respuesta basada en tus archivos locales:".to_string());
+
+    for candidate in candidates.iter().take(3) {
+        let summary = build_compact_evidence_line(&candidate.chunk_text, query);
+        lines.push(format!("- {}", summary));
+    }
+
+    lines.push("Si necesitas más precisión, abre las fuentes citadas y vuelve a preguntar con términos más específicos.".to_string());
+    lines.join("\n")
+}
+
+fn build_compact_evidence_line(content: &str, query: &str) -> String {
+    if content.trim().is_empty() {
+        return "Se detectó una coincidencia relevante en el contenido indexado.".to_string();
+    }
+
+    let lowered_content = content.to_lowercase();
+    let tokens = tokenize_query(query);
+    let position = tokens
+        .iter()
+        .filter_map(|token| lowered_content.find(token))
+        .min()
+        .unwrap_or(0);
+
+    let start_char = lowered_content[..position].chars().count().saturating_sub(36);
+    let excerpt = content
+        .chars()
+        .skip(start_char)
+        .take(180)
+        .collect::<String>();
+
+    normalize_text_for_index(&excerpt, 180)
+}
+
 fn ai_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     let path = app.path().app_data_dir().ok()?.join("ai-config.json");
 
@@ -2567,7 +2914,12 @@ pub fn run() {
             stop_file_watcher,
             get_file_watcher_status,
             configure_ai_provider,
-            get_ai_provider_status
+            get_ai_provider_status,
+            clear_index_data,
+            forget_index_root,
+            export_app_config_to_file,
+            import_app_config_from_file,
+            answer_with_local_context
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

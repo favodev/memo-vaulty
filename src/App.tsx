@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 type SearchResultItem = {
   title: string;
@@ -80,6 +80,19 @@ type FileTextPreview = {
   text: string;
 };
 
+type RagSourceItem = {
+  title: string;
+  path: string;
+  snippet: string;
+  score: number;
+};
+
+type RagAnswerResponse = {
+  answer: string;
+  grounded: boolean;
+  sources: RagSourceItem[];
+};
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -105,6 +118,7 @@ function App() {
   const [watcherStatus, setWatcherStatus] = useState<FileWatcherStatus | null>(null);
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
   const [imagesOnly, setImagesOnly] = useState(false);
+  const [isMaintenanceBusy, setIsMaintenanceBusy] = useState(false);
   const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
   const [quickLookImageMeta, setQuickLookImageMeta] = useState<ImageMetadata | null>(null);
   const [isQuickLookOpen, setIsQuickLookOpen] = useState(false);
@@ -113,41 +127,43 @@ function App() {
   const [quickLookVisualLoaded, setQuickLookVisualLoaded] = useState(false);
   const [quickLookVisualFailed, setQuickLookVisualFailed] = useState(false);
   const [searchModeBadge, setSearchModeBadge] = useState<"LOCAL" | "CLOUD" | null>(null);
+  const [isRagLoading, setIsRagLoading] = useState(false);
+  const [ragResponse, setRagResponse] = useState<RagAnswerResponse | null>(null);
+
+  const refreshStatus = async () => {
+    try {
+      const status = await invoke<IndexStatus>("get_index_status");
+      setIndexStatus(status);
+    } catch {
+      setIndexStatus(null);
+    }
+
+    try {
+      const diagnostics = await invoke<IndexDiagnostics>("get_index_diagnostics");
+      setIndexDiagnostics(diagnostics);
+    } catch {
+      setIndexDiagnostics(null);
+    }
+
+    try {
+      const status = await invoke<AiProviderStatus>("get_ai_provider_status");
+      setAiProviderStatus(status);
+      setAiModel(status.embedding_model);
+      setAiBaseUrl(status.base_url);
+    } catch {
+      setAiProviderStatus(null);
+    }
+
+    try {
+      const watcher = await invoke<FileWatcherStatus>("get_file_watcher_status");
+      setWatcherStatus(watcher);
+    } catch {
+      setWatcherStatus(null);
+    }
+  };
 
   useEffect(() => {
-    const loadStatus = async () => {
-      try {
-        const status = await invoke<IndexStatus>("get_index_status");
-        setIndexStatus(status);
-      } catch {
-        setIndexStatus(null);
-      }
-
-      try {
-        const diagnostics = await invoke<IndexDiagnostics>("get_index_diagnostics");
-        setIndexDiagnostics(diagnostics);
-      } catch {
-        setIndexDiagnostics(null);
-      }
-
-      try {
-        const status = await invoke<AiProviderStatus>("get_ai_provider_status");
-        setAiProviderStatus(status);
-        setAiModel(status.embedding_model);
-        setAiBaseUrl(status.base_url);
-      } catch {
-        setAiProviderStatus(null);
-      }
-
-      try {
-        const watcher = await invoke<FileWatcherStatus>("get_file_watcher_status");
-        setWatcherStatus(watcher);
-      } catch {
-        setWatcherStatus(null);
-      }
-    };
-
-    void loadStatus();
+    void refreshStatus();
   }, []);
 
   useEffect(() => {
@@ -302,6 +318,47 @@ function App() {
     }
   };
 
+  const runLocalAnswer = async () => {
+    const cleanQuery = query.trim();
+    if (!cleanQuery) {
+      setRagResponse(null);
+      return;
+    }
+
+    setIsRagLoading(true);
+    setErrorMessage(null);
+
+    try {
+      const exclusions = excludedExtensions
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const excludedFolderRules = excludedFolders
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+      const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
+      const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+
+      const response = await invoke<RagAnswerResponse>("answer_with_local_context", {
+        query: cleanQuery,
+        roots: searchRoots,
+        excludedExtensions: exclusions,
+        excludedFolders: excludedFolderRules,
+        maxFileSizeMb: maxSizeValue,
+        topK: 4,
+      });
+
+      setRagResponse(response);
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo generar respuesta local" });
+    } finally {
+      setIsRagLoading(false);
+    }
+  };
+
   const pickFolders = async () => {
     const selected = await openDialog({
       directory: true,
@@ -322,6 +379,108 @@ function App() {
 
   const removeRoot = (pathToRemove: string) => {
     setSearchRoots((prev) => prev.filter((path) => path !== pathToRemove));
+  };
+
+  const forgetRootPersisted = async (rootPath: string) => {
+    setIsMaintenanceBusy(true);
+    setErrorMessage(null);
+
+    try {
+      const status = await invoke<IndexStatus>("forget_index_root", {
+        root: rootPath,
+        reindex: true,
+      });
+      setIndexStatus(status);
+      setSearchRoots(status.roots);
+      setIndexFeedback({ type: "success", text: "Carpeta olvidada y reindexada" });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo olvidar carpeta" });
+    } finally {
+      setIsMaintenanceBusy(false);
+    }
+  };
+
+  const resetIndexData = async () => {
+    const accepted = window.confirm("Esto borrará snapshot e índices locales (SQLite/LanceDB). ¿Continuar?");
+    if (!accepted) {
+      return;
+    }
+
+    setIsMaintenanceBusy(true);
+    setErrorMessage(null);
+
+    try {
+      const status = await invoke<IndexStatus>("clear_index_data");
+      setIndexStatus(status);
+      setSearchRoots([]);
+      setResults([]);
+      setHasSearched(false);
+      setSelectedIndex(-1);
+      setQuickLookPath(null);
+      setIndexFeedback({ type: "success", text: "Índice local reiniciado" });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo reiniciar índice" });
+    } finally {
+      setIsMaintenanceBusy(false);
+    }
+  };
+
+  const exportConfigToJson = async () => {
+    const target = await saveDialog({
+      title: "Exportar configuración",
+      defaultPath: "memovault-config.json",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+
+    if (!target) {
+      return;
+    }
+
+    setIsMaintenanceBusy(true);
+    try {
+      await invoke<string>("export_app_config_to_file", {
+        path: target,
+        includeSecrets: false,
+      });
+      setIndexFeedback({ type: "success", text: "Config exportada" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo exportar config" });
+    } finally {
+      setIsMaintenanceBusy(false);
+    }
+  };
+
+  const importConfigFromJson = async () => {
+    const selected = await openDialog({
+      multiple: false,
+      directory: false,
+      title: "Importar configuración",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+
+    if (!selected || Array.isArray(selected)) {
+      return;
+    }
+
+    setIsMaintenanceBusy(true);
+    try {
+      const status = await invoke<IndexStatus>("import_app_config_from_file", {
+        path: selected,
+        reindex: true,
+      });
+      setIndexStatus(status);
+      if (status.roots.length > 0) {
+        setSearchRoots(status.roots);
+      }
+      setIndexFeedback({ type: "success", text: "Config importada" });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo importar config" });
+    } finally {
+      setIsMaintenanceBusy(false);
+    }
   };
 
   const startIndexing = async (roots?: string[]) => {
@@ -702,6 +861,17 @@ function App() {
                   <span key={root} className="inline-flex max-w-full items-center gap-1 truncate rounded-md bg-emerald-500/15 px-2 py-1 text-[11px] text-emerald-300 ring-1 ring-emerald-400/30">
                     <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4.3a2 2 0 0 1 1.4.58l1.22 1.22a2 2 0 0 0 1.41.58H18.5A2.5 2.5 0 0 1 21 10v8.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 18.5Z"/></svg>
                     <span className="truncate">{root}</span>
+                    <button
+                      type="button"
+                      className="rounded-sm bg-black/20 px-1 text-[10px] text-emerald-200 hover:bg-black/40"
+                      title="Olvidar carpeta y reindexar"
+                      disabled={isMaintenanceBusy || isIndexing}
+                      onClick={() => {
+                        void forgetRootPersisted(root);
+                      }}
+                    >
+                      ×
+                    </button>
                   </span>
                 ))}
                 {hasMoreRoots && (
@@ -838,6 +1008,7 @@ function App() {
             onChange={(e) => {
               setQuery(e.target.value);
               setSelectedIndex(-1);
+              setRagResponse(null);
             }}
             onKeyDown={(e) => {
               if (e.key === "ArrowDown" && results.length > 0) {
@@ -900,6 +1071,18 @@ function App() {
             Solo imágenes
           </button>
 
+          <button
+            type="button"
+            className="shrink-0 rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-gray-300 transition-colors hover:bg-white/20"
+            onClick={() => {
+              void runLocalAnswer();
+            }}
+            disabled={isRagLoading}
+            title="Responder usando tus archivos indexados"
+          >
+            {isRagLoading ? "Respondiendo..." : "Responder"}
+          </button>
+
           {searchModeBadge && (
             <span
               className={`mr-1 rounded-md px-2 py-1 text-[10px] font-medium ${
@@ -924,6 +1107,60 @@ function App() {
 
         {!isLoading && !errorMessage && hasSearched && results.length === 0 && (
           <p className="mt-4 text-sm text-center text-gray-500">No se encontraron resultados.</p>
+        )}
+
+        {ragResponse && (
+          <div className="mt-5 rounded-xl bg-white/4 p-4 ring-1 ring-white/10">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-medium text-white">Respuesta con evidencia local</p>
+              <span
+                className={`rounded-md px-2 py-1 text-[10px] font-medium ${
+                  ragResponse.grounded
+                    ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30"
+                    : "bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/30"
+                }`}
+              >
+                {ragResponse.grounded ? "CON EVIDENCIA" : "SIN EVIDENCIA"}
+              </span>
+            </div>
+
+            <pre className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-gray-300">{ragResponse.answer}</pre>
+
+            {ragResponse.sources.length > 0 && (
+              <div className="mt-3 space-y-2">
+                {ragResponse.sources.map((source) => (
+                  <div key={`${source.path}-${source.score}`} className="rounded-md bg-white/5 p-2 ring-1 ring-white/10">
+                    <p className="truncate text-[11px] text-white">{source.title}</p>
+                    <p className="mt-1 line-clamp-2 text-[11px] text-gray-400">{source.snippet}</p>
+                    <div className="mt-1 flex items-center gap-2">
+                      <p className="truncate text-[10px] text-gray-500">{source.path}</p>
+                      <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] text-gray-300">score {source.score.toFixed(2)}</span>
+                    </div>
+                    <div className="mt-2 flex items-center gap-2">
+                      <button
+                        type="button"
+                        className="rounded-md bg-white/10 px-2 py-1 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
+                        onClick={() => {
+                          void openFile(source.path);
+                        }}
+                      >
+                        Abrir fuente
+                      </button>
+                      <button
+                        type="button"
+                        className="rounded-md bg-white/5 px-2 py-1 text-[10px] text-gray-300 transition-colors hover:bg-white/15"
+                        onClick={() => {
+                          void openContainingFolder(source.path);
+                        }}
+                      >
+                        Carpeta
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         )}
 
         {!isLoading && results.length > 0 && (
@@ -1229,6 +1466,48 @@ function App() {
                   >
                     Indexar selección
                   </button>
+                </div>
+
+                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-gray-400">Mantenimiento y respaldo</p>
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    Exporta/importa configuración y gestiona limpieza total del índice local.
+                  </p>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      disabled={isMaintenanceBusy}
+                      onClick={() => {
+                        void exportConfigToJson();
+                      }}
+                    >
+                      Exportar config
+                    </button>
+
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      disabled={isMaintenanceBusy}
+                      onClick={() => {
+                        void importConfigFromJson();
+                      }}
+                    >
+                      Importar config
+                    </button>
+
+                    <button
+                      type="button"
+                      className="rounded-md bg-red-500/20 px-3 py-1.5 text-xs text-red-300 ring-1 ring-red-400/30 transition-colors hover:bg-red-500/30"
+                      disabled={isMaintenanceBusy || isIndexing}
+                      onClick={() => {
+                        void resetIndexData();
+                      }}
+                    >
+                      Reset índice local
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
