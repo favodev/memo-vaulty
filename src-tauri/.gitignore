@@ -8,3 +8,8 @@
 
 # Local CLIP/ONNX model artifacts
 /clip models/
+
+# Local bundled CLIP resources (do not upload model files)
+/resources/models/clip/*.onnx
+/resources/models/clip/tokenizer.json
+!/resources/models/clip/.gitkeep

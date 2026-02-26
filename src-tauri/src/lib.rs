@@ -16,6 +16,7 @@ use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
 use rusqlite::{params, params_from_iter, Connection};
+use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager, State};
 use exif::{In, Reader as ExifReader, Tag};
 use tract_onnx::prelude::*;
@@ -719,15 +720,30 @@ fn configure_clip_onnx(
 }
 
 #[tauri::command]
-fn get_clip_onnx_status(state: State<'_, AppState>) -> ClipOnnxStatus {
-    let guard = state.clip_config.lock().ok();
-    let maybe_cfg = guard.and_then(|value| value.as_ref().cloned());
-    clip_status_from_config(maybe_cfg.as_ref())
+fn get_clip_onnx_status(app: tauri::AppHandle, state: State<'_, AppState>) -> ClipOnnxStatus {
+    let stored = state
+        .clip_config
+        .lock()
+        .ok()
+        .and_then(|value| value.as_ref().cloned());
+
+    if let Some(config) = stored {
+        return clip_status_from_config(Some(&config));
+    }
+
+    if let Some(detected) = detect_clip_config(&app) {
+        if let Ok(mut guard) = state.clip_config.lock() {
+            *guard = Some(detected.clone());
+        }
+        return clip_status_from_config(Some(&detected));
+    }
+
+    clip_status_from_config(None)
 }
 
 #[tauri::command]
 fn clip_text_to_image_search(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     query: String,
     limit: Option<usize>,
@@ -741,13 +757,26 @@ fn clip_text_to_image_search(
         return Ok(Vec::new());
     }
 
-    let config = state
+    let mut config = state
         .clip_config
         .lock()
         .ok()
         .and_then(|value| value.as_ref().cloned())
-        .filter(|value| value.enabled)
-        .ok_or_else(|| "CLIP/ONNX no está configurado o está desactivado".to_string())?;
+        .filter(|value| value.enabled);
+
+    if config.is_none() {
+        config = detect_clip_config(&app).filter(|value| value.enabled);
+        if let Some(found) = config.clone() {
+            if let Ok(mut guard) = state.clip_config.lock() {
+                *guard = Some(found.clone());
+            }
+            let _ = save_clip_config(&app, &found);
+        }
+    }
+
+    let config = config.ok_or_else(|| {
+        "CLIP/ONNX no está configurado. Puedes usar modelos embebidos en resources/models/clip o clip models".to_string()
+    })?;
 
     let query_embedding = run_clip_text_embedding(&config, clean_query)?;
     if query_embedding.is_empty() {
@@ -3473,6 +3502,71 @@ fn load_clip_config(app: &tauri::AppHandle) -> Option<ClipOnnxConfig> {
     serde_json::from_str::<ClipOnnxConfig>(&content).ok()
 }
 
+fn detect_clip_config(app: &tauri::AppHandle) -> Option<ClipOnnxConfig> {
+    let image_candidates = [
+        "models/clip/vision_model_quantized.onnx",
+        "models/clip/vision_model.onnx",
+        "resources/models/clip/vision_model_quantized.onnx",
+        "resources/models/clip/vision_model.onnx",
+        "clip models/vision_model_quantized.onnx",
+        "clip models/vision_model.onnx",
+        "clip models/image_model.onnx",
+    ];
+
+    let text_candidates = [
+        "models/clip/text_model_quantized.onnx",
+        "models/clip/text_model.onnx",
+        "resources/models/clip/text_model_quantized.onnx",
+        "resources/models/clip/text_model.onnx",
+        "clip models/text_model_quantized.onnx",
+        "clip models/text_model.onnx",
+    ];
+
+    let tokenizer_candidates = [
+        "models/clip/tokenizer.json",
+        "resources/models/clip/tokenizer.json",
+        "clip models/tokenizer.json",
+    ];
+
+    let image_model_path = image_candidates
+        .iter()
+        .find_map(|candidate| resolve_clip_candidate_path(app, candidate))?;
+    let text_model_path = text_candidates
+        .iter()
+        .find_map(|candidate| resolve_clip_candidate_path(app, candidate))?;
+    let tokenizer_path = tokenizer_candidates
+        .iter()
+        .find_map(|candidate| resolve_clip_candidate_path(app, candidate))?;
+
+    Some(ClipOnnxConfig {
+        enabled: true,
+        image_model_path: image_model_path.to_string_lossy().to_string(),
+        text_model_path: text_model_path.to_string_lossy().to_string(),
+        tokenizer_path: tokenizer_path.to_string_lossy().to_string(),
+        input_size: 224,
+        max_length: 77,
+    })
+}
+
+fn resolve_clip_candidate_path(app: &tauri::AppHandle, relative: &str) -> Option<PathBuf> {
+    let resource_resolved = app
+        .path()
+        .resolve(relative, BaseDirectory::Resource)
+        .ok()
+        .filter(|path| path.exists());
+
+    if resource_resolved.is_some() {
+        return resource_resolved;
+    }
+
+    let project_resolved = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
+    if project_resolved.exists() {
+        return Some(project_resolved);
+    }
+
+    None
+}
+
 fn default_chat_base_url_value() -> String {
     "https://openrouter.ai/api/v1/chat/completions".to_string()
 }
@@ -3916,6 +4010,11 @@ pub fn run() {
                 if let Ok(mut guard) = app.state::<AppState>().clip_config.lock() {
                     *guard = Some(clip_config);
                 }
+            } else if let Some(detected) = detect_clip_config(app.handle()) {
+                if let Ok(mut guard) = app.state::<AppState>().clip_config.lock() {
+                    *guard = Some(detected.clone());
+                }
+                let _ = save_clip_config(app.handle(), &detected);
             }
 
             Ok(())
