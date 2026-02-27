@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::fs::File;
 use std::fs;
 use std::io::BufReader;
@@ -20,6 +21,7 @@ use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager, State};
 use exif::{In, Reader as ExifReader, Tag};
 use tract_onnx::prelude::*;
+use sysinfo::System;
 use tokenizers::Tokenizer;
 
 #[tauri::command]
@@ -120,6 +122,8 @@ struct RuntimeMetricsState {
     indexing_runs: u64,
     indexing_total_ms: u64,
     last_index_ms: u64,
+    embedding_cache_hits: u64,
+    embedding_cache_misses: u64,
 }
 
 #[derive(Serialize)]
@@ -131,6 +135,44 @@ struct RuntimeMetrics {
     indexing_runs: u64,
     indexing_avg_ms: f32,
     last_index_ms: u64,
+    embedding_cache_hits: u64,
+    embedding_cache_misses: u64,
+    embedding_cache_hit_rate: f32,
+    embedding_cache_items: usize,
+}
+
+#[derive(Serialize)]
+struct EmbeddingCacheStatus {
+    enabled: bool,
+    items: usize,
+    hits: u64,
+    misses: u64,
+    hit_rate: f32,
+}
+
+#[derive(Serialize)]
+struct HardwareProfile {
+    cpu_cores: usize,
+    cpu_brand: String,
+    total_memory_gb: f32,
+    recommended_mode: String,
+    recommended_top_k: usize,
+    recommended_max_file_size_mb: u64,
+    note: String,
+}
+
+#[derive(Serialize)]
+struct SearchBenchmarkResult {
+    query: String,
+    iterations: usize,
+    avg_ms: f32,
+    p95_ms: u64,
+    best_ms: u64,
+    worst_ms: u64,
+    last_result_count: usize,
+    candidate_limit: usize,
+    images_only: bool,
+    backend: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -402,6 +444,7 @@ struct AppState {
     runtime_metrics: Mutex<RuntimeMetricsState>,
     clip_config: Mutex<Option<ClipOnnxConfig>>,
     clip_image_cache: Mutex<HashMap<String, Vec<f32>>>,
+    text_embedding_cache: Mutex<HashMap<String, Vec<f32>>>,
 }
 
 impl Default for AppState {
@@ -419,6 +462,7 @@ impl Default for AppState {
             runtime_metrics: Mutex::new(RuntimeMetricsState::default()),
             clip_config: Mutex::new(None),
             clip_image_cache: Mutex::new(HashMap::new()),
+            text_embedding_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -461,9 +505,19 @@ fn get_runtime_metrics(state: State<'_, AppState>) -> RuntimeMetrics {
                 indexing_runs: 0,
                 indexing_avg_ms: 0.0,
                 last_index_ms: 0,
+                embedding_cache_hits: 0,
+                embedding_cache_misses: 0,
+                embedding_cache_hit_rate: 0.0,
+                embedding_cache_items: 0,
             }
         }
     };
+
+    let cache_items = state
+        .text_embedding_cache
+        .lock()
+        .map(|cache| cache.len())
+        .unwrap_or(0);
 
     RuntimeMetrics {
         semantic_calls: guard.semantic_calls,
@@ -473,7 +527,159 @@ fn get_runtime_metrics(state: State<'_, AppState>) -> RuntimeMetrics {
         indexing_runs: guard.indexing_runs,
         indexing_avg_ms: compute_avg_ms(guard.indexing_total_ms, guard.indexing_runs),
         last_index_ms: guard.last_index_ms,
+        embedding_cache_hits: guard.embedding_cache_hits,
+        embedding_cache_misses: guard.embedding_cache_misses,
+        embedding_cache_hit_rate: compute_hit_rate(guard.embedding_cache_hits, guard.embedding_cache_misses),
+        embedding_cache_items: cache_items,
     }
+}
+
+#[tauri::command]
+fn get_embedding_cache_status(state: State<'_, AppState>) -> EmbeddingCacheStatus {
+    let (hits, misses) = state
+        .runtime_metrics
+        .lock()
+        .map(|metrics| (metrics.embedding_cache_hits, metrics.embedding_cache_misses))
+        .unwrap_or((0, 0));
+    let items = state
+        .text_embedding_cache
+        .lock()
+        .map(|cache| cache.len())
+        .unwrap_or(0);
+
+    EmbeddingCacheStatus {
+        enabled: true,
+        items,
+        hits,
+        misses,
+        hit_rate: compute_hit_rate(hits, misses),
+    }
+}
+
+#[tauri::command]
+fn clear_embedding_cache(state: State<'_, AppState>) -> Result<(), String> {
+    if let Ok(mut cache) = state.text_embedding_cache.lock() {
+        cache.clear();
+    }
+
+    if let Ok(mut metrics) = state.runtime_metrics.lock() {
+        metrics.embedding_cache_hits = 0;
+        metrics.embedding_cache_misses = 0;
+    }
+
+    append_audit_log(state.inner(), "embeddings.cache.clear", "cache limpiada".to_string());
+    Ok(())
+}
+
+#[tauri::command]
+fn get_hardware_profile() -> HardwareProfile {
+    detect_hardware_profile()
+}
+
+#[tauri::command]
+async fn run_local_semantic_benchmark(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    query: String,
+    iterations: Option<usize>,
+    candidate_limit: Option<usize>,
+    roots: Option<Vec<String>>,
+    excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+    images_only: Option<bool>,
+) -> Result<SearchBenchmarkResult, String> {
+    let clean_query = query.trim();
+    if clean_query.is_empty() {
+        return Err("La consulta de benchmark no puede estar vacía".to_string());
+    }
+
+    let loops = iterations.unwrap_or(8).clamp(3, 40);
+    let cap = candidate_limit.unwrap_or(80).clamp(20, 200);
+    let search_roots = resolve_roots(roots);
+    let exclusions = normalize_extensions(excluded_extensions);
+    let folder_exclusions = normalize_folder_rules(excluded_folders);
+    let max_file_size_bytes = max_size_bytes(max_file_size_mb);
+    let images_only = images_only.unwrap_or(false);
+
+    let mut durations_ms = Vec::<u64>::with_capacity(loops);
+    let mut last_result_count = 0usize;
+    let mut lancedb_successes = 0usize;
+
+    for _ in 0..loops {
+        let started = Instant::now();
+        let candidates = match load_chunk_candidates_from_lancedb(
+            &app,
+            clean_query,
+            &search_roots,
+            &exclusions,
+            &folder_exclusions,
+            max_file_size_bytes,
+            cap,
+            images_only,
+        )
+        .await
+        {
+            Ok(value) if !value.is_empty() => {
+                lancedb_successes = lancedb_successes.saturating_add(1);
+                value
+            }
+            _ => load_chunk_candidates(
+                &app,
+                clean_query,
+                &search_roots,
+                &exclusions,
+                &folder_exclusions,
+                max_file_size_bytes,
+                cap,
+                images_only,
+            )?,
+        };
+
+        last_result_count = candidates.len().min(20);
+        durations_ms.push(started.elapsed().as_millis() as u64);
+    }
+
+    durations_ms.sort_unstable();
+    let best_ms = durations_ms.first().copied().unwrap_or(0);
+    let worst_ms = durations_ms.last().copied().unwrap_or(0);
+    let total = durations_ms.iter().copied().sum::<u64>();
+    let avg_ms = if loops == 0 { 0.0 } else { total as f32 / loops as f32 };
+    let p95_index = ((durations_ms.len() as f32 * 0.95).ceil() as usize).saturating_sub(1);
+    let p95_ms = durations_ms
+        .get(p95_index.min(durations_ms.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0);
+
+    let backend = if lancedb_successes == loops {
+        "lancedb"
+    } else if lancedb_successes == 0 {
+        "sqlite-fallback"
+    } else {
+        "mixed"
+    };
+
+    append_audit_log(
+        state.inner(),
+        "benchmark.semantic.local",
+        format!(
+            "iterations={} avg_ms={:.2} p95_ms={} backend={} images_only={}",
+            loops, avg_ms, p95_ms, backend, images_only
+        ),
+    );
+
+    Ok(SearchBenchmarkResult {
+        query: clean_query.to_string(),
+        iterations: loops,
+        avg_ms,
+        p95_ms,
+        best_ms,
+        worst_ms,
+        last_result_count,
+        candidate_limit: cap,
+        images_only,
+        backend: backend.to_string(),
+    })
 }
 
 #[tauri::command]
@@ -1050,7 +1256,7 @@ async fn semantic_search(
             inputs.push(trimmed);
         }
 
-        let vectors = request_embeddings(&config, &inputs).await?;
+        let vectors = request_embeddings(state.inner(), &config, &inputs).await?;
         if vectors.len() == inputs.len() {
             let query_vector = &vectors[0];
             let mut scored = Vec::new();
@@ -3707,10 +3913,49 @@ fn mask_api_key(value: &str) -> String {
     format!("{}...{}", prefix, suffix)
 }
 
-async fn request_embeddings(config: &AiProviderConfig, input: &[String]) -> Result<Vec<Vec<f32>>, String> {
+async fn request_embeddings(state: &AppState, config: &AiProviderConfig, input: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut output = vec![Vec::<f32>::new(); input.len()];
+    let mut misses = Vec::<(usize, String, String)>::new();
+
+    if let Ok(cache) = state.text_embedding_cache.lock() {
+        for (index, text) in input.iter().enumerate() {
+            let key = embedding_cache_key(config, text);
+            if let Some(found) = cache.get(&key) {
+                output[index] = found.clone();
+                if let Ok(mut metrics) = state.runtime_metrics.lock() {
+                    metrics.embedding_cache_hits = metrics.embedding_cache_hits.saturating_add(1);
+                }
+            } else {
+                misses.push((index, key, text.clone()));
+            }
+        }
+    } else {
+        for (index, text) in input.iter().enumerate() {
+            let key = embedding_cache_key(config, text);
+            misses.push((index, key, text.clone()));
+        }
+    }
+
+    if misses.is_empty() {
+        return Ok(output);
+    }
+
+    if let Ok(mut metrics) = state.runtime_metrics.lock() {
+        metrics.embedding_cache_misses = metrics.embedding_cache_misses.saturating_add(misses.len() as u64);
+    }
+
+    let missing_input = misses
+        .iter()
+        .map(|(_, _, text)| text.clone())
+        .collect::<Vec<_>>();
+
     let payload = serde_json::json!({
         "model": config.embedding_model,
-        "input": input,
+        "input": missing_input,
     });
 
     let client = reqwest::Client::new();
@@ -3738,11 +3983,28 @@ async fn request_embeddings(config: &AiProviderConfig, input: &[String]) -> Resu
         .await
         .map_err(|err| format!("Respuesta de embeddings inválida: {err}"))?;
 
-    Ok(parsed
+    let embeddings = parsed
         .data
         .into_iter()
         .map(|item| item.embedding)
-        .collect())
+        .collect::<Vec<_>>();
+
+    if embeddings.len() != misses.len() {
+        return Err("Embeddings devolvieron una cantidad inesperada de vectores".to_string());
+    }
+
+    if let Ok(mut cache) = state.text_embedding_cache.lock() {
+        for ((index, key, _), embedding) in misses.into_iter().zip(embeddings.into_iter()) {
+            cache.insert(key, embedding.clone());
+            output[index] = embedding;
+        }
+    } else {
+        for ((index, _, _), embedding) in misses.into_iter().zip(embeddings.into_iter()) {
+            output[index] = embedding;
+        }
+    }
+
+    Ok(output)
 }
 
 async fn request_chat_answer(config: &AiProviderConfig, query: &str, context: &str) -> Result<String, String> {
@@ -4014,6 +4276,71 @@ fn compute_avg_ms(total_ms: u64, calls: u64) -> f32 {
     total_ms as f32 / calls as f32
 }
 
+fn compute_hit_rate(hits: u64, misses: u64) -> f32 {
+    let total = hits.saturating_add(misses);
+    if total == 0 {
+        return 0.0;
+    }
+    (hits as f32 * 100.0) / total as f32
+}
+
+fn embedding_cache_key(config: &AiProviderConfig, input: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.provider.hash(&mut hasher);
+    config.base_url.hash(&mut hasher);
+    config.embedding_model.hash(&mut hasher);
+    input.hash(&mut hasher);
+    format!("{}:{}:{:x}", config.provider, config.embedding_model, hasher.finish())
+}
+
+fn detect_hardware_profile() -> HardwareProfile {
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4);
+
+    let mut system = System::new_all();
+    system.refresh_memory();
+    let total_memory_gb = (system.total_memory() as f32 / (1024.0 * 1024.0)).max(0.0);
+    let cpu_brand = std::env::var("PROCESSOR_IDENTIFIER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "CPU no detectada".to_string());
+
+    let (recommended_mode, recommended_top_k, recommended_max_file_size_mb, note) =
+        if cpu_cores <= 4 || total_memory_gb < 8.0 {
+            (
+                "local".to_string(),
+                3usize,
+                64u64,
+                "Equipo modesto: prioriza LOCAL, top-k bajo y archivos más pequeños para mantener fluidez.".to_string(),
+            )
+        } else if cpu_cores >= 12 && total_memory_gb >= 24.0 {
+            (
+                "auto".to_string(),
+                6usize,
+                256u64,
+                "Equipo potente: puedes usar AUTO con top-k más alto y lotes grandes sin degradación notable.".to_string(),
+            )
+        } else {
+            (
+                "auto".to_string(),
+                4usize,
+                128u64,
+                "Perfil equilibrado: usa AUTO, top-k medio y límites de archivo estándar.".to_string(),
+            )
+        };
+
+    HardwareProfile {
+        cpu_cores,
+        cpu_brand,
+        total_memory_gb,
+        recommended_mode,
+        recommended_top_k,
+        recommended_max_file_size_mb,
+        note,
+    }
+}
+
 fn record_runtime_metric(state: &AppState, metric: &str, elapsed_ms: u64) {
     if let Ok(mut guard) = state.runtime_metrics.lock() {
         match metric {
@@ -4155,6 +4482,10 @@ pub fn run() {
             stop_file_watcher,
             get_file_watcher_status,
             get_runtime_metrics,
+            get_embedding_cache_status,
+            clear_embedding_cache,
+            get_hardware_profile,
+            run_local_semantic_benchmark,
             get_audit_logs,
             clear_audit_logs,
             export_audit_logs_to_file,

@@ -115,6 +115,41 @@ type RuntimeMetrics = {
   indexing_runs: number;
   indexing_avg_ms: number;
   last_index_ms: number;
+  embedding_cache_hits: number;
+  embedding_cache_misses: number;
+  embedding_cache_hit_rate: number;
+  embedding_cache_items: number;
+};
+
+type EmbeddingCacheStatus = {
+  enabled: boolean;
+  items: number;
+  hits: number;
+  misses: number;
+  hit_rate: number;
+};
+
+type HardwareProfile = {
+  cpu_cores: number;
+  cpu_brand: string;
+  total_memory_gb: number;
+  recommended_mode: string;
+  recommended_top_k: number;
+  recommended_max_file_size_mb: number;
+  note: string;
+};
+
+type SearchBenchmarkResult = {
+  query: string;
+  iterations: number;
+  avg_ms: number;
+  p95_ms: number;
+  best_ms: number;
+  worst_ms: number;
+  last_result_count: number;
+  candidate_limit: number;
+  images_only: boolean;
+  backend: string;
 };
 
 type AuditLogEntry = {
@@ -203,6 +238,12 @@ function App() {
   const [isClipSearching, setIsClipSearching] = useState(false);
   const [isClipValidating, setIsClipValidating] = useState(false);
   const [clipValidation, setClipValidation] = useState<ClipValidationStatus | null>(null);
+  const [embeddingCacheStatus, setEmbeddingCacheStatus] = useState<EmbeddingCacheStatus | null>(null);
+  const [hardwareProfile, setHardwareProfile] = useState<HardwareProfile | null>(null);
+  const [benchmarkQuery, setBenchmarkQuery] = useState("nota");
+  const [benchmarkIterations, setBenchmarkIterations] = useState("8");
+  const [isBenchmarking, setIsBenchmarking] = useState(false);
+  const [benchmarkResult, setBenchmarkResult] = useState<SearchBenchmarkResult | null>(null);
 
   const refreshStatus = async () => {
     try {
@@ -242,6 +283,20 @@ function App() {
       setRuntimeMetrics(metrics);
     } catch {
       setRuntimeMetrics(null);
+    }
+
+    try {
+      const cacheStatus = await invoke<EmbeddingCacheStatus>("get_embedding_cache_status");
+      setEmbeddingCacheStatus(cacheStatus);
+    } catch {
+      setEmbeddingCacheStatus(null);
+    }
+
+    try {
+      const profile = await invoke<HardwareProfile>("get_hardware_profile");
+      setHardwareProfile(profile);
+    } catch {
+      setHardwareProfile(null);
     }
 
     try {
@@ -620,6 +675,59 @@ function App() {
       setIndexFeedback({ type: "error", text: "No se pudo validar CLIP" });
     } finally {
       setIsClipValidating(false);
+    }
+  };
+
+  const clearEmbeddingCache = async () => {
+    try {
+      await invoke("clear_embedding_cache");
+      setIndexFeedback({ type: "success", text: "Caché de embeddings limpiada" });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo limpiar caché de embeddings" });
+    }
+  };
+
+  const runLocalBenchmark = async () => {
+    const cleanQuery = benchmarkQuery.trim();
+    if (!cleanQuery) {
+      return;
+    }
+
+    const parsedIterations = Number.parseInt(benchmarkIterations, 10);
+
+    const exclusions = excludedExtensions
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+
+    const excludedFolderRules = excludedFolders
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+
+    const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
+    const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+
+    setIsBenchmarking(true);
+    try {
+      const result = await invoke<SearchBenchmarkResult>("run_local_semantic_benchmark", {
+        query: cleanQuery,
+        iterations: Number.isFinite(parsedIterations) ? parsedIterations : 8,
+        candidateLimit: 80,
+        roots: searchRoots,
+        excludedExtensions: exclusions,
+        excludedFolders: excludedFolderRules,
+        maxFileSizeMb: maxSizeValue,
+        imagesOnly,
+      });
+      setBenchmarkResult(result);
+      setIndexFeedback({ type: "success", text: `Benchmark OK · avg ${result.avg_ms.toFixed(1)} ms · p95 ${result.p95_ms} ms` });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "Benchmark local falló" });
+    } finally {
+      setIsBenchmarking(false);
     }
   };
 
@@ -1303,6 +1411,9 @@ function App() {
             <p className="mt-1 text-[11px] text-gray-500">
               Indexaciones: {runtimeMetrics.indexing_runs} · promedio {runtimeMetrics.indexing_avg_ms.toFixed(0)} ms · última {runtimeMetrics.last_index_ms} ms
             </p>
+            <p className="mt-1 text-[11px] text-gray-500">
+              Caché embeddings: {runtimeMetrics.embedding_cache_items} items · hits {runtimeMetrics.embedding_cache_hits} · misses {runtimeMetrics.embedding_cache_misses} · hit rate {runtimeMetrics.embedding_cache_hit_rate.toFixed(1)}%
+            </p>
           </div>
         )}
 
@@ -1933,6 +2044,86 @@ function App() {
                       Estado: {watcherStatus?.running ? "activo" : "detenido"}
                     </span>
                   </div>
+                </div>
+
+                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-gray-400">Rendimiento adaptativo</p>
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    Perfil hardware + caché de embeddings + benchmark local para ajustar rendimiento.
+                  </p>
+
+                  {hardwareProfile && (
+                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
+                      <p className="text-[11px] text-gray-300">
+                        CPU {hardwareProfile.cpu_cores} hilos · RAM {hardwareProfile.total_memory_gb.toFixed(1)} GB
+                      </p>
+                      <p className="mt-1 truncate text-[10px] text-gray-500">{hardwareProfile.cpu_brand}</p>
+                      <p className="mt-1 text-[10px] text-gray-400">
+                        Recomendado: modo {hardwareProfile.recommended_mode.toUpperCase()} · top-k {hardwareProfile.recommended_top_k} · max file {hardwareProfile.recommended_max_file_size_mb} MB
+                      </p>
+                      <p className="mt-1 text-[10px] text-gray-500">{hardwareProfile.note}</p>
+                    </div>
+                  )}
+
+                  {embeddingCacheStatus && (
+                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
+                      <p className="text-[11px] text-gray-300">
+                        Caché embeddings: {embeddingCacheStatus.items} items · hits {embeddingCacheStatus.hits} · misses {embeddingCacheStatus.misses}
+                      </p>
+                      <p className="mt-1 text-[10px] text-gray-500">Hit rate: {embeddingCacheStatus.hit_rate.toFixed(1)}%</p>
+                      <button
+                        type="button"
+                        className="mt-2 rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
+                        onClick={() => {
+                          void clearEmbeddingCache();
+                        }}
+                      >
+                        Limpiar caché embeddings
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="mt-3 space-y-2">
+                    <input
+                      type="text"
+                      className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                      placeholder="Consulta benchmark"
+                      value={benchmarkQuery}
+                      onChange={(e) => setBenchmarkQuery(e.target.value)}
+                    />
+
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={3}
+                        max={40}
+                        className="w-24 appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
+                        value={benchmarkIterations}
+                        onChange={(e) => setBenchmarkIterations(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="rounded-md bg-cyan-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-cyan-500"
+                        disabled={isBenchmarking}
+                        onClick={() => {
+                          void runLocalBenchmark();
+                        }}
+                      >
+                        {isBenchmarking ? "Benchmark..." : "Correr benchmark local"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {benchmarkResult && (
+                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
+                      <p className="text-[11px] text-gray-300">
+                        {benchmarkResult.backend} · {benchmarkResult.iterations} iter · avg {benchmarkResult.avg_ms.toFixed(1)} ms · p95 {benchmarkResult.p95_ms} ms
+                      </p>
+                      <p className="mt-1 text-[10px] text-gray-500">
+                        best {benchmarkResult.best_ms} ms · worst {benchmarkResult.worst_ms} ms · resultados {benchmarkResult.last_result_count}
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap gap-2 pt-1">
