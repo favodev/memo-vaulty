@@ -623,6 +623,18 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    if (!isConfigOpen || isClipValidating) {
+      return;
+    }
+
+    if (!clipStatus?.configured || !clipStatus.enabled) {
+      return;
+    }
+
+    void validateClipSetup();
+  }, [isConfigOpen, clipStatus?.configured, clipStatus?.enabled]);
+
   const exportChatHistory = async () => {
     const target = await saveDialog({
       title: "Exportar historial de chat",
@@ -1393,6 +1405,21 @@ function App() {
           >
             {isClipSearching ? "CLIP..." : "CLIP Img"}
           </button>
+
+          {clipStatus?.configured && (
+            <span
+              className={`shrink-0 rounded-md px-2 py-1 text-[10px] font-medium ring-1 ${
+                clipValidation?.text_inference_ok && (!clipValidation.sample_image_path || clipValidation.image_inference_ok)
+                  ? "bg-emerald-500/20 text-emerald-300 ring-emerald-400/30"
+                  : "bg-amber-500/20 text-amber-300 ring-amber-400/30"
+              }`}
+              title={clipValidation?.message ?? "Estado CLIP pendiente de verificación"}
+            >
+              {clipValidation?.text_inference_ok && (!clipValidation.sample_image_path || clipValidation.image_inference_ok)
+                ? "CLIP OK"
+                : "CLIP CHECK"}
+            </span>
+          )}
 
           <div className="flex shrink-0 items-center gap-1">
             <button
