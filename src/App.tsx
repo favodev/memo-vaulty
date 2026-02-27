@@ -186,6 +186,13 @@ type ClipImageCacheStatus = {
   items: number;
 };
 
+type PerformanceRuntimeStatus = {
+  adaptive_enabled: boolean;
+  last_decision: string;
+  last_candidate_limit: number;
+  last_rag_top_k: number;
+};
+
 type AuditLogEntry = {
   timestamp: string;
   event: string;
@@ -285,6 +292,8 @@ function App() {
   const [coldHotResult, setColdHotResult] = useState<SearchColdHotBenchmarkResult | null>(null);
   const [isColdHotBenchmarking, setIsColdHotBenchmarking] = useState(false);
   const [clipImageCacheStatus, setClipImageCacheStatus] = useState<ClipImageCacheStatus | null>(null);
+  const [performanceRuntimeStatus, setPerformanceRuntimeStatus] = useState<PerformanceRuntimeStatus | null>(null);
+  const [isPerformanceRuntimeSaving, setIsPerformanceRuntimeSaving] = useState(false);
 
   const refreshStatus = async () => {
     try {
@@ -338,6 +347,13 @@ function App() {
       setHardwareProfile(profile);
     } catch {
       setHardwareProfile(null);
+    }
+
+    try {
+      const perfRuntime = await invoke<PerformanceRuntimeStatus>("get_performance_runtime_status");
+      setPerformanceRuntimeStatus(perfRuntime);
+    } catch {
+      setPerformanceRuntimeStatus(null);
     }
 
     try {
@@ -541,6 +557,7 @@ function App() {
       setErrorMessage("No se pudo ejecutar la búsqueda local.");
     } finally {
       setIsLoading(false);
+      await refreshStatus();
     }
   };
 
@@ -590,6 +607,23 @@ function App() {
       setIndexFeedback({ type: "error", text: "No se pudo generar respuesta local" });
     } finally {
       setIsRagLoading(false);
+      await refreshStatus();
+    }
+  };
+
+  const toggleAdaptiveRuntime = async () => {
+    const nextValue = !(performanceRuntimeStatus?.adaptive_enabled ?? true);
+    setIsPerformanceRuntimeSaving(true);
+    try {
+      const status = await invoke<PerformanceRuntimeStatus>("configure_performance_runtime", {
+        adaptiveEnabled: nextValue,
+      });
+      setPerformanceRuntimeStatus(status);
+      setIndexFeedback({ type: "success", text: `Autoajuste ${status.adaptive_enabled ? "activado" : "desactivado"}` });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo actualizar autoajuste" });
+    } finally {
+      setIsPerformanceRuntimeSaving(false);
     }
   };
 
@@ -2218,6 +2252,28 @@ function App() {
                   <p className="mt-1 text-[11px] text-gray-500">
                     Perfil hardware + caché de embeddings + benchmark local para ajustar rendimiento.
                   </p>
+
+                  {performanceRuntimeStatus && (
+                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className={`rounded px-2 py-0.5 text-[10px] ${performanceRuntimeStatus.adaptive_enabled ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"}`}>
+                          {performanceRuntimeStatus.adaptive_enabled ? "AUTOAJUSTE ON" : "AUTOAJUSTE OFF"}
+                        </span>
+                        <button
+                          type="button"
+                          className="rounded-md bg-white/10 px-2 py-0.5 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
+                          disabled={isPerformanceRuntimeSaving}
+                          onClick={() => {
+                            void toggleAdaptiveRuntime();
+                          }}
+                        >
+                          {isPerformanceRuntimeSaving ? "Guardando..." : "Cambiar"}
+                        </button>
+                      </div>
+                      <p className="mt-1 text-[10px] text-gray-500">último candidate limit: {performanceRuntimeStatus.last_candidate_limit} · último rag k: {performanceRuntimeStatus.last_rag_top_k}</p>
+                      <p className="mt-1 truncate text-[10px] text-gray-500">{performanceRuntimeStatus.last_decision}</p>
+                    </div>
+                  )}
 
                   {hardwareProfile && (
                     <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">

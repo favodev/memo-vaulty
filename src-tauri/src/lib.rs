@@ -476,6 +476,37 @@ struct ExportableAppConfig {
     excluded_folders: Vec<String>,
     max_file_size_mb: u64,
     ai_provider: Option<AiProviderConfig>,
+    #[serde(default)]
+    performance_runtime: Option<PerformanceRuntimeConfig>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PerformanceRuntimeConfig {
+    adaptive_enabled: bool,
+}
+
+impl Default for PerformanceRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            adaptive_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PerformanceRuntimeState {
+    config: PerformanceRuntimeConfig,
+    last_decision: String,
+    last_candidate_limit: usize,
+    last_rag_top_k: usize,
+}
+
+#[derive(Serialize)]
+struct PerformanceRuntimeStatus {
+    adaptive_enabled: bool,
+    last_decision: String,
+    last_candidate_limit: usize,
+    last_rag_top_k: usize,
 }
 
 #[derive(Clone)]
@@ -549,6 +580,7 @@ struct AppState {
     clip_config: Mutex<Option<ClipOnnxConfig>>,
     clip_image_cache: Mutex<HashMap<String, Vec<f32>>>,
     text_embedding_cache: Mutex<HashMap<String, Vec<f32>>>,
+    performance_runtime: Mutex<PerformanceRuntimeState>,
 }
 
 impl Default for AppState {
@@ -567,8 +599,62 @@ impl Default for AppState {
             clip_config: Mutex::new(None),
             clip_image_cache: Mutex::new(HashMap::new()),
             text_embedding_cache: Mutex::new(HashMap::new()),
+            performance_runtime: Mutex::new(PerformanceRuntimeState {
+                config: PerformanceRuntimeConfig::default(),
+                last_decision: "sin decisiones aún".to_string(),
+                last_candidate_limit: 80,
+                last_rag_top_k: 4,
+            }),
         }
     }
+}
+
+#[tauri::command]
+fn get_performance_runtime_status(state: State<'_, AppState>) -> PerformanceRuntimeStatus {
+    state
+        .performance_runtime
+        .lock()
+        .map(|runtime| PerformanceRuntimeStatus {
+            adaptive_enabled: runtime.config.adaptive_enabled,
+            last_decision: runtime.last_decision.clone(),
+            last_candidate_limit: runtime.last_candidate_limit,
+            last_rag_top_k: runtime.last_rag_top_k,
+        })
+        .unwrap_or(PerformanceRuntimeStatus {
+            adaptive_enabled: true,
+            last_decision: "sin estado".to_string(),
+            last_candidate_limit: 80,
+            last_rag_top_k: 4,
+        })
+}
+
+#[tauri::command]
+fn configure_performance_runtime(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    adaptive_enabled: Option<bool>,
+) -> Result<PerformanceRuntimeStatus, String> {
+    {
+        let mut runtime = state
+            .performance_runtime
+            .lock()
+            .map_err(|_| "No se pudo actualizar runtime performance".to_string())?;
+        if let Some(value) = adaptive_enabled {
+            runtime.config.adaptive_enabled = value;
+        }
+        save_performance_runtime_config(&app, &runtime.config)?;
+    }
+
+    append_audit_log(
+        state.inner(),
+        "performance.runtime.updated",
+        format!(
+            "adaptive_enabled={}",
+            adaptive_enabled.unwrap_or(true)
+        ),
+    );
+
+    Ok(get_performance_runtime_status(state))
 }
 
 #[tauri::command]
@@ -1481,6 +1567,35 @@ async fn semantic_search(
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
     let images_only = images_only.unwrap_or(false);
+    let adaptive_enabled = state
+        .performance_runtime
+        .lock()
+        .map(|runtime| runtime.config.adaptive_enabled)
+        .unwrap_or(true);
+    let hardware = detect_hardware_profile();
+    let candidate_limit = if adaptive_enabled {
+        adaptive_candidate_limit(clean_query, images_only, &hardware)
+    } else {
+        80
+    };
+
+    let decision = if adaptive_enabled {
+        format!(
+            "adaptive:on cores={} ram={:.1}GB query_tokens={} images_only={} candidate_limit={}",
+            hardware.cpu_cores,
+            hardware.total_memory_gb,
+            tokenize_query(clean_query).len(),
+            images_only,
+            candidate_limit
+        )
+    } else {
+        format!(
+            "adaptive:off candidate_limit={} images_only={}",
+            candidate_limit,
+            images_only
+        )
+    };
+    update_performance_decision(state.inner(), decision, Some(candidate_limit), None);
 
     let mut candidates = match load_chunk_candidates_from_lancedb(
         &app,
@@ -1489,7 +1604,7 @@ async fn semantic_search(
         &exclusions,
         &folder_exclusions,
         max_file_size_bytes,
-        80,
+        candidate_limit,
         images_only,
     )
     .await
@@ -1502,7 +1617,7 @@ async fn semantic_search(
             &exclusions,
             &folder_exclusions,
             max_file_size_bytes,
-            80,
+            candidate_limit,
             images_only,
         )?,
     };
@@ -1658,9 +1773,36 @@ async fn answer_with_local_context(
     let exclusions = normalize_extensions(excluded_extensions);
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
-    let max_sources = top_k.unwrap_or(4).clamp(1, 8);
+    let adaptive_enabled = state
+        .performance_runtime
+        .lock()
+        .map(|runtime| runtime.config.adaptive_enabled)
+        .unwrap_or(true);
+    let hardware = detect_hardware_profile();
+    let adaptive_top_k = adaptive_rag_top_k(&hardware);
+    let max_sources = top_k
+        .unwrap_or(if adaptive_enabled { adaptive_top_k } else { 4 })
+        .clamp(1, 8);
     let strict_grounding = strict_grounding.unwrap_or(true);
     let min_score = min_score.unwrap_or(0.55).clamp(0.0, 1.6);
+    let rag_candidate_cap = max_sources
+        .saturating_mul(if adaptive_enabled { 5 } else { 4 })
+        .max(20)
+        .min(60);
+
+    update_performance_decision(
+        state.inner(),
+        format!(
+            "rag adaptive={} top_k={} candidate_cap={} strict={} min_score={:.2}",
+            adaptive_enabled,
+            max_sources,
+            rag_candidate_cap,
+            strict_grounding,
+            min_score
+        ),
+        None,
+        Some(max_sources),
+    );
 
     let candidates = match load_chunk_candidates_from_lancedb(
         &app,
@@ -1669,7 +1811,7 @@ async fn answer_with_local_context(
         &exclusions,
         &folder_exclusions,
         max_file_size_bytes,
-        max_sources.saturating_mul(4).max(20),
+        rag_candidate_cap,
         false,
     )
     .await
@@ -1682,7 +1824,7 @@ async fn answer_with_local_context(
             &exclusions,
             &folder_exclusions,
             max_file_size_bytes,
-            max_sources.saturating_mul(4).max(20),
+            rag_candidate_cap,
             false,
         )?,
     };
@@ -1995,6 +2137,11 @@ fn export_app_config_to_file(
         excluded_folders: settings.excluded_folders,
         max_file_size_mb: settings.max_file_size_mb,
         ai_provider,
+        performance_runtime: state
+            .performance_runtime
+            .lock()
+            .ok()
+            .map(|runtime| runtime.config.clone()),
     };
 
     let serialized = serde_json::to_string_pretty(&payload)
@@ -2051,6 +2198,13 @@ fn import_app_config_from_file(
             if let Ok(mut guard) = state.ai_config.lock() {
                 *guard = Some(ai_cfg);
             }
+        }
+    }
+
+    if let Some(perf_cfg) = parsed.performance_runtime {
+        if let Ok(mut runtime) = state.performance_runtime.lock() {
+            runtime.config.adaptive_enabled = perf_cfg.adaptive_enabled;
+            let _ = save_performance_runtime_config(&app, &runtime.config);
         }
     }
 
@@ -4121,6 +4275,81 @@ fn load_clip_config(app: &tauri::AppHandle) -> Option<ClipOnnxConfig> {
     serde_json::from_str::<ClipOnnxConfig>(&content).ok()
 }
 
+fn performance_runtime_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("performance-runtime.json");
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    Some(path)
+}
+
+fn save_performance_runtime_config(app: &tauri::AppHandle, config: &PerformanceRuntimeConfig) -> Result<(), String> {
+    let path = performance_runtime_config_path(app)
+        .ok_or_else(|| "No se pudo resolver ruta de runtime performance".to_string())?;
+    let serialized = serde_json::to_string(config)
+        .map_err(|err| format!("No se pudo serializar runtime performance: {err}"))?;
+    fs::write(path, serialized)
+        .map_err(|err| format!("No se pudo guardar runtime performance: {err}"))
+}
+
+fn load_performance_runtime_config(app: &tauri::AppHandle) -> Option<PerformanceRuntimeConfig> {
+    let path = performance_runtime_config_path(app)?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<PerformanceRuntimeConfig>(&content).ok()
+}
+
+fn adaptive_candidate_limit(query: &str, images_only: bool, hardware: &HardwareProfile) -> usize {
+    let tokens = tokenize_query(query).len();
+    let mut limit = if hardware.cpu_cores <= 4 || hardware.total_memory_gb < 8.0 {
+        48usize
+    } else if hardware.cpu_cores >= 12 && hardware.total_memory_gb >= 24.0 {
+        120usize
+    } else {
+        80usize
+    };
+
+    if tokens <= 2 {
+        limit = limit.saturating_add(16);
+    } else if tokens >= 8 {
+        limit = limit.saturating_sub(12);
+    }
+
+    if images_only {
+        limit = limit.min(72);
+    }
+
+    limit.clamp(24, 140)
+}
+
+fn adaptive_rag_top_k(hardware: &HardwareProfile) -> usize {
+    if hardware.cpu_cores <= 4 || hardware.total_memory_gb < 8.0 {
+        3
+    } else if hardware.cpu_cores >= 12 && hardware.total_memory_gb >= 24.0 {
+        6
+    } else {
+        4
+    }
+}
+
+fn update_performance_decision(
+    state: &AppState,
+    decision: String,
+    candidate_limit: Option<usize>,
+    rag_top_k: Option<usize>,
+) {
+    if let Ok(mut runtime) = state.performance_runtime.lock() {
+        runtime.last_decision = decision;
+        if let Some(value) = candidate_limit {
+            runtime.last_candidate_limit = value;
+        }
+        if let Some(value) = rag_top_k {
+            runtime.last_rag_top_k = value;
+        }
+    }
+}
+
 fn detect_clip_config(app: &tauri::AppHandle) -> Option<ClipOnnxConfig> {
     let image_candidates = [
         "models/clip/vision_model_quantized.onnx",
@@ -4777,6 +5006,12 @@ pub fn run() {
                 let _ = save_clip_config(app.handle(), &detected);
             }
 
+            if let Some(perf_cfg) = load_performance_runtime_config(app.handle()) {
+                if let Ok(mut runtime) = app.state::<AppState>().performance_runtime.lock() {
+                    runtime.config = perf_cfg;
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4795,6 +5030,8 @@ pub fn run() {
             stop_file_watcher,
             get_file_watcher_status,
             get_runtime_metrics,
+            get_performance_runtime_status,
+            configure_performance_runtime,
             get_embedding_cache_status,
             clear_embedding_cache,
             get_hardware_profile,
