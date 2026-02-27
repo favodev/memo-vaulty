@@ -133,6 +133,19 @@ type ClipOnnxStatus = {
   max_length: number;
 };
 
+type ClipValidationStatus = {
+  configured: boolean;
+  tokenizer_ok: boolean;
+  text_model_ok: boolean;
+  image_model_ok: boolean;
+  text_inference_ok: boolean;
+  image_inference_ok: boolean;
+  text_dim: number | null;
+  image_dim: number | null;
+  sample_image_path: string | null;
+  message: string;
+};
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -188,6 +201,8 @@ function App() {
   const [clipMaxLength, setClipMaxLength] = useState("77");
   const [isClipSaving, setIsClipSaving] = useState(false);
   const [isClipSearching, setIsClipSearching] = useState(false);
+  const [isClipValidating, setIsClipValidating] = useState(false);
+  const [clipValidation, setClipValidation] = useState<ClipValidationStatus | null>(null);
 
   const refreshStatus = async () => {
     try {
@@ -589,6 +604,22 @@ function App() {
       setIndexFeedback({ type: "error", text: "Búsqueda CLIP/ONNX falló" });
     } finally {
       setIsClipSearching(false);
+    }
+  };
+
+  const validateClipSetup = async () => {
+    setIsClipValidating(true);
+    try {
+      const status = await invoke<ClipValidationStatus>("validate_clip_onnx_setup", {
+        sampleImagePath: null,
+      });
+      setClipValidation(status);
+      setIndexFeedback({ type: status.text_inference_ok ? "success" : "error", text: status.text_inference_ok ? "CLIP validado" : "CLIP con problemas" });
+    } catch {
+      setClipValidation(null);
+      setIndexFeedback({ type: "error", text: "No se pudo validar CLIP" });
+    } finally {
+      setIsClipValidating(false);
     }
   };
 
@@ -2060,12 +2091,42 @@ function App() {
                       {isClipSaving ? "Guardando..." : "Guardar CLIP"}
                     </button>
 
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      disabled={isClipValidating}
+                      onClick={() => {
+                        void validateClipSetup();
+                      }}
+                    >
+                      {isClipValidating ? "Validando..." : "Verificar CLIP"}
+                    </button>
+
                     {clipStatus?.configured && (
                       <span className={`text-[11px] ${clipStatus.enabled ? "text-emerald-300" : "text-amber-300"}`}>
                         {clipStatus.enabled ? "CLIP activo" : "CLIP inactivo"}
                       </span>
                     )}
                   </div>
+
+                  {clipValidation && (
+                    <div className="mt-3 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
+                      <p className="text-[11px] text-gray-300">{clipValidation.message}</p>
+                      <p className="mt-1 text-[10px] text-gray-500">
+                        tokenizer: {clipValidation.tokenizer_ok ? "OK" : "FAIL"} · text model: {clipValidation.text_model_ok ? "OK" : "FAIL"} · image model: {clipValidation.image_model_ok ? "OK" : "FAIL"}
+                      </p>
+                      <p className="mt-1 text-[10px] text-gray-500">
+                        infer texto: {clipValidation.text_inference_ok ? "OK" : "FAIL"}
+                        {clipValidation.text_dim ? ` (${clipValidation.text_dim} dim)` : ""}
+                        {" · "}
+                        infer imagen: {clipValidation.image_inference_ok ? "OK" : "PEND/FAIL"}
+                        {clipValidation.image_dim ? ` (${clipValidation.image_dim} dim)` : ""}
+                      </p>
+                      {clipValidation.sample_image_path && (
+                        <p className="mt-1 truncate text-[10px] text-gray-500">muestra: {clipValidation.sample_image_path}</p>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

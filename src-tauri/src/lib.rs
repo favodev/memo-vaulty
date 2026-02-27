@@ -154,6 +154,20 @@ struct ClipOnnxStatus {
     max_length: usize,
 }
 
+#[derive(Serialize)]
+struct ClipValidationStatus {
+    configured: bool,
+    tokenizer_ok: bool,
+    text_model_ok: bool,
+    image_model_ok: bool,
+    text_inference_ok: bool,
+    image_inference_ok: bool,
+    text_dim: Option<usize>,
+    image_dim: Option<usize>,
+    sample_image_path: Option<String>,
+    message: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct IndexedFileItem {
     title: String,
@@ -852,6 +866,113 @@ fn clip_text_to_image_search(
     );
 
     Ok(results)
+}
+
+#[tauri::command]
+fn validate_clip_onnx_setup(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    sample_image_path: Option<String>,
+) -> ClipValidationStatus {
+    let config = state
+        .clip_config
+        .lock()
+        .ok()
+        .and_then(|value| value.as_ref().cloned())
+        .or_else(|| detect_clip_config(&app));
+
+    let Some(config) = config else {
+        return ClipValidationStatus {
+            configured: false,
+            tokenizer_ok: false,
+            text_model_ok: false,
+            image_model_ok: false,
+            text_inference_ok: false,
+            image_inference_ok: false,
+            text_dim: None,
+            image_dim: None,
+            sample_image_path: None,
+            message: "CLIP no configurado: faltan rutas de modelo/tokenizer".to_string(),
+        };
+    };
+
+    let tokenizer_ok = Tokenizer::from_file(&config.tokenizer_path).is_ok();
+    let text_model_ok = tract_onnx::onnx().model_for_path(&config.text_model_path).is_ok();
+    let image_model_ok = tract_onnx::onnx().model_for_path(&config.image_model_path).is_ok();
+
+    let mut text_inference_ok = false;
+    let mut text_dim = None;
+    if tokenizer_ok && text_model_ok {
+        if let Ok(text_vec) = run_clip_text_embedding(&config, "prueba clip") {
+            if !text_vec.is_empty() {
+                text_inference_ok = true;
+                text_dim = Some(text_vec.len());
+            }
+        }
+    }
+
+    let auto_sample = state
+        .index
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.files.clone()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| item.path)
+        .find(|path| is_image_path(&PathBuf::from(path)));
+
+    let sample_path = sample_image_path
+        .filter(|path| !path.trim().is_empty())
+        .or(auto_sample);
+
+    let mut image_inference_ok = false;
+    let mut image_dim = None;
+    if image_model_ok {
+        if let Some(path) = sample_path.as_ref() {
+            if let Ok(image_vec) = run_clip_image_embedding(&config, path) {
+                if !image_vec.is_empty() {
+                    image_inference_ok = true;
+                    image_dim = Some(image_vec.len());
+                }
+            }
+        }
+    }
+
+    let message = if tokenizer_ok && text_model_ok && image_model_ok && text_inference_ok {
+        if sample_path.is_some() {
+            if image_inference_ok {
+                "CLIP validado: tokenizer/modelos OK e inferencia texto+imagen operativa".to_string()
+            } else {
+                "CLIP parcial: texto OK, pero inferencia de imagen falló con la muestra".to_string()
+            }
+        } else {
+            "CLIP validado: texto OK; falta imagen de muestra para validar encoder visual".to_string()
+        }
+    } else {
+        "CLIP inválido: revisa rutas/modelos/tokenizer y compatibilidad ONNX".to_string()
+    };
+
+    append_audit_log(
+        state.inner(),
+        "clip.validate",
+        format!(
+            "tokenizer_ok={} text_model_ok={} image_model_ok={} text_inference_ok={} image_inference_ok={}",
+            tokenizer_ok, text_model_ok, image_model_ok, text_inference_ok, image_inference_ok
+        ),
+    );
+
+    ClipValidationStatus {
+        configured: true,
+        tokenizer_ok,
+        text_model_ok,
+        image_model_ok,
+        text_inference_ok,
+        image_inference_ok,
+        text_dim,
+        image_dim,
+        sample_image_path: sample_path,
+        message,
+    }
 }
 
 #[tauri::command]
@@ -4039,6 +4160,7 @@ pub fn run() {
             export_audit_logs_to_file,
             configure_clip_onnx,
             get_clip_onnx_status,
+            validate_clip_onnx_setup,
             clip_text_to_image_search,
             configure_ai_provider,
             get_ai_provider_status,
