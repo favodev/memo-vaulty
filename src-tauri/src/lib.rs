@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use base64::Engine;
 use std::fs::File;
 use std::fs;
 use std::io::BufReader;
@@ -72,6 +73,15 @@ struct FileTextPreview {
     available: bool,
     source: String,
     text: String,
+}
+
+#[derive(Serialize)]
+struct FileVisualPreview {
+    available: bool,
+    mime: String,
+    data_url: Option<String>,
+    size_bytes: u64,
+    reason: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -317,6 +327,71 @@ fn get_file_text_preview(path: String, max_chars: Option<usize>) -> Result<FileT
         available: false,
         source: "unsupported".to_string(),
         text: "Vista textual no disponible para este tipo de archivo.".to_string(),
+    })
+}
+
+#[tauri::command]
+fn get_file_visual_preview(path: String, max_mb: Option<u64>) -> Result<FileVisualPreview, String> {
+    let file_path = PathBuf::from(&path);
+    if !file_path.exists() {
+        return Err("El archivo no existe".to_string());
+    }
+
+    let extension = file_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+
+    let mime = match extension.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "tiff" | "tif" => "image/tiff",
+        _ => {
+            return Ok(FileVisualPreview {
+                available: false,
+                mime: String::new(),
+                data_url: None,
+                size_bytes: 0,
+                reason: Some("Tipo no soportado para preview visual".to_string()),
+            })
+        }
+    }
+    .to_string();
+
+    let metadata = fs::metadata(&file_path)
+        .map_err(|err| format!("No se pudo leer metadata del archivo: {err}"))?;
+    let size_bytes = metadata.len();
+    let max_size_mb = max_mb.unwrap_or(16).clamp(2, 64);
+    let max_bytes = max_size_mb.saturating_mul(1024 * 1024);
+
+    if size_bytes > max_bytes {
+        return Ok(FileVisualPreview {
+            available: false,
+            mime,
+            data_url: None,
+            size_bytes,
+            reason: Some(format!(
+                "Archivo demasiado grande para preview visual ({} MB > {} MB)",
+                (size_bytes as f64 / (1024.0 * 1024.0)).round(),
+                max_size_mb
+            )),
+        });
+    }
+
+    let bytes = fs::read(&file_path).map_err(|err| format!("No se pudo leer archivo visual: {err}"))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    Ok(FileVisualPreview {
+        available: true,
+        mime: mime.clone(),
+        data_url: Some(format!("data:{};base64,{}", mime, encoded)),
+        size_bytes,
+        reason: None,
     })
 }
 
@@ -2310,7 +2385,22 @@ fn clear_index_data_internal(app: &tauri::AppHandle, state: &AppState) -> Result
         let _ = fs::create_dir_all(&path);
     }
 
-    append_audit_log(state, "indexing.cleared", "snapshot+sqlite+lancedb reset".to_string());
+    if let Ok(mut text_cache) = state.text_embedding_cache.lock() {
+        text_cache.clear();
+    }
+    if let Ok(mut clip_cache) = state.clip_image_cache.lock() {
+        clip_cache.clear();
+    }
+    if let Ok(mut metrics) = state.runtime_metrics.lock() {
+        metrics.embedding_cache_hits = 0;
+        metrics.embedding_cache_misses = 0;
+    }
+
+    append_audit_log(
+        state,
+        "indexing.cleared",
+        "snapshot+sqlite+lancedb+cache reset".to_string(),
+    );
 
     Ok(current_index_status(state))
 }
@@ -4694,6 +4784,7 @@ pub fn run() {
             open_file,
             get_image_metadata,
             get_file_text_preview,
+            get_file_visual_preview,
             search_stub,
             semantic_search,
             start_indexing,

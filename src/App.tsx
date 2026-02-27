@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -80,6 +80,14 @@ type FileTextPreview = {
   available: boolean;
   source: string;
   text: string;
+};
+
+type FileVisualPreview = {
+  available: boolean;
+  mime: string;
+  data_url: string | null;
+  size_bytes: number;
+  reason: string | null;
 };
 
 type RagSourceItem = {
@@ -242,6 +250,9 @@ function App() {
   const [quickLookMode, setQuickLookMode] = useState<"visual" | "text">("visual");
   const [quickLookVisualLoaded, setQuickLookVisualLoaded] = useState(false);
   const [quickLookVisualFailed, setQuickLookVisualFailed] = useState(false);
+  const [quickLookVisualUrl, setQuickLookVisualUrl] = useState<string | null>(null);
+  const [quickLookVisualReason, setQuickLookVisualReason] = useState<string | null>(null);
+  const [isQuickLookVisualLoading, setIsQuickLookVisualLoading] = useState(false);
   const [searchModeBadge, setSearchModeBadge] = useState<"LOCAL" | "CLOUD" | null>(null);
   const [isRagLoading, setIsRagLoading] = useState(false);
   const [ragResponse, setRagResponse] = useState<RagAnswerResponse | null>(null);
@@ -1226,18 +1237,6 @@ function App() {
     return lower.slice(dot + 1);
   }, [quickLookItem?.path]);
 
-  const quickLookUrl = useMemo(() => {
-    if (!quickLookItem?.path) {
-      return null;
-    }
-
-    try {
-      return convertFileSrc(quickLookItem.path);
-    } catch {
-      return null;
-    }
-  }, [quickLookItem?.path]);
-
   const isQuickLookImage = quickLookExt === "png" || quickLookExt === "jpg" || quickLookExt === "jpeg" || quickLookExt === "webp" || quickLookExt === "gif" || quickLookExt === "bmp" || quickLookExt === "tiff";
   const hasVisualPreview = isQuickLookImage || quickLookExt === "pdf";
 
@@ -1295,6 +1294,60 @@ function App() {
   }, [quickLookItem?.path, isQuickLookOpen]);
 
   useEffect(() => {
+    if (!quickLookItem?.path || !isQuickLookOpen || quickLookMode !== "visual" || !hasVisualPreview) {
+      setQuickLookVisualUrl(null);
+      setQuickLookVisualReason(null);
+      setIsQuickLookVisualLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsQuickLookVisualLoading(true);
+    setQuickLookVisualUrl(null);
+    setQuickLookVisualReason(null);
+
+    void invoke<FileVisualPreview>("get_file_visual_preview", {
+      path: quickLookItem.path,
+      maxMb: quickLookExt === "pdf" ? 24 : 16,
+    })
+      .then((preview) => {
+        if (cancelled) {
+          return;
+        }
+
+        if (preview.available && preview.data_url) {
+          setQuickLookVisualUrl(preview.data_url);
+        } else {
+          setQuickLookVisualFailed(true);
+          setQuickLookVisualReason(preview.reason ?? "Preview visual no disponible");
+          if (quickLookTextPreview?.available) {
+            setQuickLookMode("text");
+          }
+        }
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+
+        setQuickLookVisualFailed(true);
+        setQuickLookVisualReason("Preview visual falló al cargar");
+        if (quickLookTextPreview?.available) {
+          setQuickLookMode("text");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsQuickLookVisualLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [quickLookItem?.path, isQuickLookOpen, quickLookMode, hasVisualPreview, quickLookExt, quickLookTextPreview?.available]);
+
+  useEffect(() => {
     if (!isQuickLookOpen || quickLookMode !== "visual" || quickLookVisualLoaded || quickLookVisualFailed) {
       return;
     }
@@ -1306,9 +1359,10 @@ function App() {
     const timeout = setTimeout(() => {
       if (!quickLookVisualLoaded && quickLookTextPreview?.available) {
         setQuickLookVisualFailed(true);
+        setQuickLookVisualReason("El render visual tardó demasiado; cambiamos a texto");
         setQuickLookMode("text");
       }
-    }, 2600);
+    }, 7000);
 
     return () => clearTimeout(timeout);
   }, [isQuickLookOpen, quickLookMode, quickLookExt, quickLookVisualLoaded, quickLookVisualFailed, quickLookTextPreview?.available]);
@@ -2530,7 +2584,7 @@ function App() {
                   )}
 
                   {quickLookVisualFailed && (
-                    <p className="mt-1 text-[10px] text-amber-300">Render visual falló; cambiamos automáticamente a vista textual.</p>
+                    <p className="mt-1 text-[10px] text-amber-300">{quickLookVisualReason ?? "Render visual falló; cambiamos automáticamente a vista textual."}</p>
                   )}
                 </div>
                 <div className="flex items-center gap-2">
@@ -2565,9 +2619,9 @@ function App() {
               </div>
 
               <div className="mt-3 h-[68vh] overflow-hidden rounded-md bg-black/30 ring-1 ring-white/10">
-                {quickLookMode === "visual" && isQuickLookImage && quickLookUrl && (
+                {quickLookMode === "visual" && isQuickLookImage && quickLookVisualUrl && (
                   <img
-                    src={quickLookUrl}
+                    src={quickLookVisualUrl}
                     alt={quickLookItem.title}
                     className="h-full w-full object-contain"
                     loading="lazy"
@@ -2581,13 +2635,19 @@ function App() {
                   />
                 )}
 
-                {quickLookMode === "visual" && quickLookExt === "pdf" && quickLookUrl && (
+                {quickLookMode === "visual" && quickLookExt === "pdf" && quickLookVisualUrl && (
                   <iframe
                     title={`quicklook-modal-${quickLookItem.path}`}
-                    src={quickLookUrl}
+                    src={quickLookVisualUrl}
                     className="h-full w-full border-0"
                     onLoad={() => setQuickLookVisualLoaded(true)}
                   />
+                )}
+
+                {quickLookMode === "visual" && hasVisualPreview && isQuickLookVisualLoading && (
+                  <div className="flex h-full items-center justify-center px-6 text-center">
+                    <p className="text-xs text-gray-500">Cargando preview visual...</p>
+                  </div>
                 )}
 
                 {quickLookMode === "visual" && !hasVisualPreview && (
