@@ -127,8 +127,10 @@ struct AuditLogEntry {
 struct RuntimeMetricsState {
     semantic_calls: u64,
     semantic_total_ms: u64,
+    last_semantic_ms: u64,
     rag_calls: u64,
     rag_total_ms: u64,
+    last_rag_ms: u64,
     indexing_runs: u64,
     indexing_total_ms: u64,
     last_index_ms: u64,
@@ -149,6 +151,21 @@ struct RuntimeMetrics {
     embedding_cache_misses: u64,
     embedding_cache_hit_rate: f32,
     embedding_cache_items: usize,
+    last_semantic_ms: u64,
+    last_rag_ms: u64,
+}
+
+#[derive(Serialize)]
+struct PerformanceTelemetry {
+    memory_total_gb: f32,
+    memory_available_gb: f32,
+    memory_pressure_pct: f32,
+    pressure_level: String,
+    semantic_last_ms: u64,
+    rag_last_ms: u64,
+    indexing_last_ms: u64,
+    adaptive_enabled: bool,
+    throttling_factor: f32,
 }
 
 #[derive(Serialize)]
@@ -699,6 +716,8 @@ fn get_runtime_metrics(state: State<'_, AppState>) -> RuntimeMetrics {
                 embedding_cache_misses: 0,
                 embedding_cache_hit_rate: 0.0,
                 embedding_cache_items: 0,
+                last_semantic_ms: 0,
+                last_rag_ms: 0,
             }
         }
     };
@@ -721,6 +740,50 @@ fn get_runtime_metrics(state: State<'_, AppState>) -> RuntimeMetrics {
         embedding_cache_misses: guard.embedding_cache_misses,
         embedding_cache_hit_rate: compute_hit_rate(guard.embedding_cache_hits, guard.embedding_cache_misses),
         embedding_cache_items: cache_items,
+        last_semantic_ms: guard.last_semantic_ms,
+        last_rag_ms: guard.last_rag_ms,
+    }
+}
+
+#[tauri::command]
+fn get_performance_telemetry(state: State<'_, AppState>) -> PerformanceTelemetry {
+    let adaptive_enabled = state
+        .performance_runtime
+        .lock()
+        .map(|runtime| runtime.config.adaptive_enabled)
+        .unwrap_or(true);
+
+    let metrics = state
+        .runtime_metrics
+        .lock()
+        .map(|value| RuntimeMetricsState {
+            semantic_calls: value.semantic_calls,
+            semantic_total_ms: value.semantic_total_ms,
+            last_semantic_ms: value.last_semantic_ms,
+            rag_calls: value.rag_calls,
+            rag_total_ms: value.rag_total_ms,
+            last_rag_ms: value.last_rag_ms,
+            indexing_runs: value.indexing_runs,
+            indexing_total_ms: value.indexing_total_ms,
+            last_index_ms: value.last_index_ms,
+            embedding_cache_hits: value.embedding_cache_hits,
+            embedding_cache_misses: value.embedding_cache_misses,
+        })
+        .unwrap_or_default();
+
+    let snapshot = runtime_pressure_snapshot();
+    let pressure_level = runtime_pressure_level(snapshot.memory_pressure_pct).to_string();
+
+    PerformanceTelemetry {
+        memory_total_gb: snapshot.total_memory_gb,
+        memory_available_gb: snapshot.available_memory_gb,
+        memory_pressure_pct: snapshot.memory_pressure_pct,
+        pressure_level,
+        semantic_last_ms: metrics.last_semantic_ms,
+        rag_last_ms: metrics.last_rag_ms,
+        indexing_last_ms: metrics.last_index_ms,
+        adaptive_enabled,
+        throttling_factor: compute_runtime_throttling_factor(snapshot.memory_pressure_pct),
     }
 }
 
@@ -1371,6 +1434,17 @@ fn clip_text_to_image_search(
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
     let max_results = limit.unwrap_or(20).clamp(1, 50);
+    let adaptive_enabled = state
+        .performance_runtime
+        .lock()
+        .map(|runtime| runtime.config.adaptive_enabled)
+        .unwrap_or(true);
+    let pressure = runtime_pressure_snapshot();
+    let inspect_limit = if adaptive_enabled {
+        adaptive_clip_inspect_limit(pressure.memory_pressure_pct)
+    } else {
+        900
+    };
 
     let snapshot_items = state
         .index
@@ -1401,7 +1475,7 @@ fn clip_text_to_image_search(
         }
 
         inspected += 1;
-        if inspected > 900 {
+        if inspected > inspect_limit {
             break;
         }
 
@@ -1431,7 +1505,14 @@ fn clip_text_to_image_search(
     append_audit_log(
         state.inner(),
         "search.clip_onnx",
-        format!("query_len={} inspected={} results={}", clean_query.chars().count(), inspected, results.len()),
+        format!(
+            "query_len={} inspected={} results={} inspect_limit={} pressure={:.1}%",
+            clean_query.chars().count(),
+            inspected,
+            results.len(),
+            inspect_limit,
+            pressure.memory_pressure_pct
+        ),
     );
 
     Ok(results)
@@ -1573,8 +1654,9 @@ async fn semantic_search(
         .map(|runtime| runtime.config.adaptive_enabled)
         .unwrap_or(true);
     let hardware = detect_hardware_profile();
+    let pressure = runtime_pressure_snapshot();
     let candidate_limit = if adaptive_enabled {
-        adaptive_candidate_limit(clean_query, images_only, &hardware)
+        adaptive_candidate_limit(clean_query, images_only, &hardware, pressure.memory_pressure_pct)
     } else {
         80
     };
@@ -1586,7 +1668,7 @@ async fn semantic_search(
             hardware.total_memory_gb,
             tokenize_query(clean_query).len(),
             images_only,
-            candidate_limit
+            candidate_limit,
         )
     } else {
         format!(
@@ -1779,6 +1861,7 @@ async fn answer_with_local_context(
         .map(|runtime| runtime.config.adaptive_enabled)
         .unwrap_or(true);
     let hardware = detect_hardware_profile();
+    let pressure = runtime_pressure_snapshot();
     let adaptive_top_k = adaptive_rag_top_k(&hardware);
     let max_sources = top_k
         .unwrap_or(if adaptive_enabled { adaptive_top_k } else { 4 })
@@ -1788,7 +1871,7 @@ async fn answer_with_local_context(
     let rag_candidate_cap = max_sources
         .saturating_mul(if adaptive_enabled { 5 } else { 4 })
         .max(20)
-        .min(60);
+        .min(if pressure.memory_pressure_pct >= 88.0 { 30 } else { 60 });
 
     update_performance_decision(
         state.inner(),
@@ -4300,7 +4383,12 @@ fn load_performance_runtime_config(app: &tauri::AppHandle) -> Option<Performance
     serde_json::from_str::<PerformanceRuntimeConfig>(&content).ok()
 }
 
-fn adaptive_candidate_limit(query: &str, images_only: bool, hardware: &HardwareProfile) -> usize {
+fn adaptive_candidate_limit(
+    query: &str,
+    images_only: bool,
+    hardware: &HardwareProfile,
+    memory_pressure_pct: f32,
+) -> usize {
     let tokens = tokenize_query(query).len();
     let mut limit = if hardware.cpu_cores <= 4 || hardware.total_memory_gb < 8.0 {
         48usize
@@ -4320,7 +4408,65 @@ fn adaptive_candidate_limit(query: &str, images_only: bool, hardware: &HardwareP
         limit = limit.min(72);
     }
 
-    limit.clamp(24, 140)
+    let factor = compute_runtime_throttling_factor(memory_pressure_pct);
+    let throttled = (limit as f32 * factor).round() as usize;
+    throttled.clamp(24, 140)
+}
+
+fn adaptive_clip_inspect_limit(memory_pressure_pct: f32) -> usize {
+    let factor = compute_runtime_throttling_factor(memory_pressure_pct);
+    ((900f32 * factor).round() as usize).clamp(180, 900)
+}
+
+struct RuntimePressureSnapshot {
+    total_memory_gb: f32,
+    available_memory_gb: f32,
+    memory_pressure_pct: f32,
+}
+
+fn runtime_pressure_snapshot() -> RuntimePressureSnapshot {
+    let mut system = System::new_all();
+    system.refresh_memory();
+    let total_kib = system.total_memory() as f32;
+    let available_kib = system.available_memory() as f32;
+
+    let total_gb = (total_kib / (1024.0 * 1024.0)).max(0.0);
+    let available_gb = (available_kib / (1024.0 * 1024.0)).max(0.0);
+    let pressure = if total_kib <= 0.0 {
+        0.0
+    } else {
+        ((total_kib - available_kib).max(0.0) / total_kib * 100.0).clamp(0.0, 100.0)
+    };
+
+    RuntimePressureSnapshot {
+        total_memory_gb: total_gb,
+        available_memory_gb: available_gb,
+        memory_pressure_pct: pressure,
+    }
+}
+
+fn runtime_pressure_level(memory_pressure_pct: f32) -> &'static str {
+    if memory_pressure_pct >= 88.0 {
+        "high"
+    } else if memory_pressure_pct >= 74.0 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn compute_runtime_throttling_factor(memory_pressure_pct: f32) -> f32 {
+    if memory_pressure_pct >= 92.0 {
+        0.35
+    } else if memory_pressure_pct >= 88.0 {
+        0.45
+    } else if memory_pressure_pct >= 80.0 {
+        0.62
+    } else if memory_pressure_pct >= 72.0 {
+        0.8
+    } else {
+        1.0
+    }
 }
 
 fn adaptive_rag_top_k(hardware: &HardwareProfile) -> usize {
@@ -4888,10 +5034,12 @@ fn record_runtime_metric(state: &AppState, metric: &str, elapsed_ms: u64) {
             "semantic" => {
                 guard.semantic_calls = guard.semantic_calls.saturating_add(1);
                 guard.semantic_total_ms = guard.semantic_total_ms.saturating_add(elapsed_ms);
+                guard.last_semantic_ms = elapsed_ms;
             }
             "rag" => {
                 guard.rag_calls = guard.rag_calls.saturating_add(1);
                 guard.rag_total_ms = guard.rag_total_ms.saturating_add(elapsed_ms);
+                guard.last_rag_ms = elapsed_ms;
             }
             "indexing" => {
                 guard.indexing_runs = guard.indexing_runs.saturating_add(1);
@@ -5030,6 +5178,7 @@ pub fn run() {
             stop_file_watcher,
             get_file_watcher_status,
             get_runtime_metrics,
+            get_performance_telemetry,
             get_performance_runtime_status,
             configure_performance_runtime,
             get_embedding_cache_status,

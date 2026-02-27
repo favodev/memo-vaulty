@@ -127,6 +127,8 @@ type RuntimeMetrics = {
   embedding_cache_misses: number;
   embedding_cache_hit_rate: number;
   embedding_cache_items: number;
+  last_semantic_ms: number;
+  last_rag_ms: number;
 };
 
 type EmbeddingCacheStatus = {
@@ -191,6 +193,18 @@ type PerformanceRuntimeStatus = {
   last_decision: string;
   last_candidate_limit: number;
   last_rag_top_k: number;
+};
+
+type PerformanceTelemetry = {
+  memory_total_gb: number;
+  memory_available_gb: number;
+  memory_pressure_pct: number;
+  pressure_level: string;
+  semantic_last_ms: number;
+  rag_last_ms: number;
+  indexing_last_ms: number;
+  adaptive_enabled: boolean;
+  throttling_factor: number;
 };
 
 type AuditLogEntry = {
@@ -294,6 +308,7 @@ function App() {
   const [clipImageCacheStatus, setClipImageCacheStatus] = useState<ClipImageCacheStatus | null>(null);
   const [performanceRuntimeStatus, setPerformanceRuntimeStatus] = useState<PerformanceRuntimeStatus | null>(null);
   const [isPerformanceRuntimeSaving, setIsPerformanceRuntimeSaving] = useState(false);
+  const [performanceTelemetry, setPerformanceTelemetry] = useState<PerformanceTelemetry | null>(null);
 
   const refreshStatus = async () => {
     try {
@@ -357,6 +372,13 @@ function App() {
     }
 
     try {
+      const telemetry = await invoke<PerformanceTelemetry>("get_performance_telemetry");
+      setPerformanceTelemetry(telemetry);
+    } catch {
+      setPerformanceTelemetry(null);
+    }
+
+    try {
       const clipCache = await invoke<ClipImageCacheStatus>("get_clip_image_cache_status");
       setClipImageCacheStatus(clipCache);
     } catch {
@@ -394,6 +416,16 @@ function App() {
     void refreshStatus();
     void refreshChatHistory();
     void refreshAuditLogs();
+  }, []);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void invoke<PerformanceTelemetry>("get_performance_telemetry")
+        .then((telemetry) => setPerformanceTelemetry(telemetry))
+        .catch(() => undefined);
+    }, 3500);
+
+    return () => clearInterval(interval);
   }, []);
 
   const refreshChatHistory = async () => {
@@ -1615,6 +1647,14 @@ function App() {
             <p className="mt-1 text-[11px] text-gray-500">
               Caché embeddings: {runtimeMetrics.embedding_cache_items} items · hits {runtimeMetrics.embedding_cache_hits} · misses {runtimeMetrics.embedding_cache_misses} · hit rate {runtimeMetrics.embedding_cache_hit_rate.toFixed(1)}%
             </p>
+            <p className="mt-1 text-[11px] text-gray-500">
+              Últimas latencias · semantic {runtimeMetrics.last_semantic_ms} ms · rag {runtimeMetrics.last_rag_ms} ms
+            </p>
+            {performanceTelemetry && (
+              <p className="mt-1 text-[11px] text-gray-500">
+                Memoria {performanceTelemetry.memory_available_gb.toFixed(1)}/{performanceTelemetry.memory_total_gb.toFixed(1)} GB libres · presión {performanceTelemetry.memory_pressure_pct.toFixed(1)}% ({performanceTelemetry.pressure_level}) · throttle x{performanceTelemetry.throttling_factor.toFixed(2)}
+              </p>
+            )}
           </div>
         )}
 
@@ -2272,6 +2312,11 @@ function App() {
                       </div>
                       <p className="mt-1 text-[10px] text-gray-500">último candidate limit: {performanceRuntimeStatus.last_candidate_limit} · último rag k: {performanceRuntimeStatus.last_rag_top_k}</p>
                       <p className="mt-1 truncate text-[10px] text-gray-500">{performanceRuntimeStatus.last_decision}</p>
+                      {performanceTelemetry && (
+                        <p className="mt-1 text-[10px] text-gray-500">
+                          telemetría live · presión {performanceTelemetry.memory_pressure_pct.toFixed(1)}% ({performanceTelemetry.pressure_level}) · libres {performanceTelemetry.memory_available_gb.toFixed(1)} GB · throttle x{performanceTelemetry.throttling_factor.toFixed(2)}
+                        </p>
+                      )}
                     </div>
                   )}
 
