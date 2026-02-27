@@ -152,6 +152,32 @@ type SearchBenchmarkResult = {
   backend: string;
 };
 
+type SearchColdHotBenchmarkResult = {
+  query: string;
+  iterations: number;
+  cold_avg_ms: number;
+  cold_p95_ms: number;
+  hot_avg_ms: number;
+  hot_p95_ms: number;
+  speedup_percent: number;
+  candidate_count: number;
+  backend: string;
+};
+
+type AppliedPerformanceProfile = {
+  cpu_cores: number;
+  total_memory_gb: number;
+  recommended_mode: string;
+  recommended_top_k: number;
+  recommended_max_file_size_mb: number;
+  applied_max_file_size_mb: number;
+  note: string;
+};
+
+type ClipImageCacheStatus = {
+  items: number;
+};
+
 type AuditLogEntry = {
   timestamp: string;
   event: string;
@@ -244,6 +270,10 @@ function App() {
   const [benchmarkIterations, setBenchmarkIterations] = useState("8");
   const [isBenchmarking, setIsBenchmarking] = useState(false);
   const [benchmarkResult, setBenchmarkResult] = useState<SearchBenchmarkResult | null>(null);
+  const [isApplyingPerfProfile, setIsApplyingPerfProfile] = useState(false);
+  const [coldHotResult, setColdHotResult] = useState<SearchColdHotBenchmarkResult | null>(null);
+  const [isColdHotBenchmarking, setIsColdHotBenchmarking] = useState(false);
+  const [clipImageCacheStatus, setClipImageCacheStatus] = useState<ClipImageCacheStatus | null>(null);
 
   const refreshStatus = async () => {
     try {
@@ -297,6 +327,13 @@ function App() {
       setHardwareProfile(profile);
     } catch {
       setHardwareProfile(null);
+    }
+
+    try {
+      const clipCache = await invoke<ClipImageCacheStatus>("get_clip_image_cache_status");
+      setClipImageCacheStatus(clipCache);
+    } catch {
+      setClipImageCacheStatus(null);
     }
 
     try {
@@ -728,6 +765,82 @@ function App() {
       setIndexFeedback({ type: "error", text: "Benchmark local falló" });
     } finally {
       setIsBenchmarking(false);
+    }
+  };
+
+  const applyPerformanceProfile = async () => {
+    setIsApplyingPerfProfile(true);
+    try {
+      const applied = await invoke<AppliedPerformanceProfile>("apply_hardware_profile_defaults");
+      setMaxFileSizeMb(String(applied.applied_max_file_size_mb));
+      setRagTopK(String(applied.recommended_top_k));
+      const recommendedMode = (applied.recommended_mode === "local" ? "local" : "auto") as "local" | "auto";
+      setAnswerMode(recommendedMode);
+      setIndexFeedback({
+        type: "success",
+        text: `Perfil aplicado · modo ${recommendedMode.toUpperCase()} · top-k ${applied.recommended_top_k} · max ${applied.applied_max_file_size_mb} MB`,
+      });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo aplicar perfil de rendimiento" });
+    } finally {
+      setIsApplyingPerfProfile(false);
+    }
+  };
+
+  const runColdHotBenchmark = async () => {
+    const cleanQuery = benchmarkQuery.trim();
+    if (!cleanQuery) {
+      return;
+    }
+
+    const parsedIterations = Number.parseInt(benchmarkIterations, 10);
+
+    const exclusions = excludedExtensions
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+
+    const excludedFolderRules = excludedFolders
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+
+    const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
+    const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+
+    setIsColdHotBenchmarking(true);
+    try {
+      const result = await invoke<SearchColdHotBenchmarkResult>("run_semantic_cold_hot_benchmark", {
+        query: cleanQuery,
+        iterations: Number.isFinite(parsedIterations) ? parsedIterations : 6,
+        candidateLimit: 60,
+        roots: searchRoots,
+        excludedExtensions: exclusions,
+        excludedFolders: excludedFolderRules,
+        maxFileSizeMb: maxSizeValue,
+        imagesOnly,
+      });
+      setColdHotResult(result);
+      setIndexFeedback({
+        type: "success",
+        text: `Cold/Hot OK · cold ${result.cold_avg_ms.toFixed(1)} ms · hot ${result.hot_avg_ms.toFixed(1)} ms · +${result.speedup_percent.toFixed(1)}%`,
+      });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "Benchmark cold/hot falló (requiere IA embeddings configurada)" });
+    } finally {
+      setIsColdHotBenchmarking(false);
+    }
+  };
+
+  const clearClipImageCache = async () => {
+    try {
+      await invoke("clear_clip_image_cache");
+      setIndexFeedback({ type: "success", text: "Caché CLIP de imágenes limpiada" });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo limpiar caché CLIP" });
     }
   };
 
@@ -2062,6 +2175,16 @@ function App() {
                         Recomendado: modo {hardwareProfile.recommended_mode.toUpperCase()} · top-k {hardwareProfile.recommended_top_k} · max file {hardwareProfile.recommended_max_file_size_mb} MB
                       </p>
                       <p className="mt-1 text-[10px] text-gray-500">{hardwareProfile.note}</p>
+                      <button
+                        type="button"
+                        className="mt-2 rounded-md bg-emerald-500/25 px-2.5 py-1 text-[11px] text-emerald-200 transition-colors hover:bg-emerald-500/35"
+                        disabled={isApplyingPerfProfile}
+                        onClick={() => {
+                          void applyPerformanceProfile();
+                        }}
+                      >
+                        {isApplyingPerfProfile ? "Aplicando..." : "Aplicar perfil recomendado"}
+                      </button>
                     </div>
                   )}
 
@@ -2111,6 +2234,16 @@ function App() {
                       >
                         {isBenchmarking ? "Benchmark..." : "Correr benchmark local"}
                       </button>
+                      <button
+                        type="button"
+                        className="rounded-md bg-indigo-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-indigo-500"
+                        disabled={isColdHotBenchmarking}
+                        onClick={() => {
+                          void runColdHotBenchmark();
+                        }}
+                      >
+                        {isColdHotBenchmarking ? "Cold/Hot..." : "Benchmark cold/hot"}
+                      </button>
                     </div>
                   </div>
 
@@ -2121,6 +2254,17 @@ function App() {
                       </p>
                       <p className="mt-1 text-[10px] text-gray-500">
                         best {benchmarkResult.best_ms} ms · worst {benchmarkResult.worst_ms} ms · resultados {benchmarkResult.last_result_count}
+                      </p>
+                    </div>
+                  )}
+
+                  {coldHotResult && (
+                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
+                      <p className="text-[11px] text-gray-300">
+                        cold avg {coldHotResult.cold_avg_ms.toFixed(1)} ms (p95 {coldHotResult.cold_p95_ms}) · hot avg {coldHotResult.hot_avg_ms.toFixed(1)} ms (p95 {coldHotResult.hot_p95_ms})
+                      </p>
+                      <p className="mt-1 text-[10px] text-gray-500">
+                        speedup cache {coldHotResult.speedup_percent.toFixed(1)}% · candidatos {coldHotResult.candidate_count} · {coldHotResult.backend}
                       </p>
                     </div>
                   )}
@@ -2324,6 +2468,20 @@ function App() {
                       <span className={`text-[11px] ${clipStatus.enabled ? "text-emerald-300" : "text-amber-300"}`}>
                         {clipStatus.enabled ? "CLIP activo" : "CLIP inactivo"}
                       </span>
+                    )}
+
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      onClick={() => {
+                        void clearClipImageCache();
+                      }}
+                    >
+                      Limpiar cache CLIP
+                    </button>
+
+                    {clipImageCacheStatus && (
+                      <span className="text-[11px] text-gray-400">cache img: {clipImageCacheStatus.items}</span>
                     )}
                   </div>
 

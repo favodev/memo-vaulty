@@ -175,6 +175,35 @@ struct SearchBenchmarkResult {
     backend: String,
 }
 
+#[derive(Serialize)]
+struct SearchColdHotBenchmarkResult {
+    query: String,
+    iterations: usize,
+    cold_avg_ms: f32,
+    cold_p95_ms: u64,
+    hot_avg_ms: f32,
+    hot_p95_ms: u64,
+    speedup_percent: f32,
+    candidate_count: usize,
+    backend: String,
+}
+
+#[derive(Serialize)]
+struct AppliedPerformanceProfile {
+    cpu_cores: usize,
+    total_memory_gb: f32,
+    recommended_mode: String,
+    recommended_top_k: usize,
+    recommended_max_file_size_mb: u64,
+    applied_max_file_size_mb: u64,
+    note: String,
+}
+
+#[derive(Serialize)]
+struct ClipImageCacheStatus {
+    items: usize,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ClipOnnxConfig {
     enabled: bool,
@@ -577,6 +606,39 @@ fn get_hardware_profile() -> HardwareProfile {
 }
 
 #[tauri::command]
+fn apply_hardware_profile_defaults(state: State<'_, AppState>) -> Result<AppliedPerformanceProfile, String> {
+    let profile = detect_hardware_profile();
+
+    let applied_max = {
+        let mut settings = state
+            .index_settings
+            .lock()
+            .map_err(|_| "No se pudo actualizar perfil de rendimiento".to_string())?;
+        settings.max_file_size_mb = profile.recommended_max_file_size_mb;
+        settings.max_file_size_mb
+    };
+
+    append_audit_log(
+        state.inner(),
+        "performance.profile.applied",
+        format!(
+            "mode={} top_k={} max_file_mb={}",
+            profile.recommended_mode, profile.recommended_top_k, applied_max
+        ),
+    );
+
+    Ok(AppliedPerformanceProfile {
+        cpu_cores: profile.cpu_cores,
+        total_memory_gb: profile.total_memory_gb,
+        recommended_mode: profile.recommended_mode,
+        recommended_top_k: profile.recommended_top_k,
+        recommended_max_file_size_mb: profile.recommended_max_file_size_mb,
+        applied_max_file_size_mb: applied_max,
+        note: profile.note,
+    })
+}
+
+#[tauri::command]
 async fn run_local_semantic_benchmark(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -680,6 +742,146 @@ async fn run_local_semantic_benchmark(
         images_only,
         backend: backend.to_string(),
     })
+}
+
+#[tauri::command]
+async fn run_semantic_cold_hot_benchmark(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    query: String,
+    iterations: Option<usize>,
+    candidate_limit: Option<usize>,
+    roots: Option<Vec<String>>,
+    excluded_extensions: Option<Vec<String>>,
+    excluded_folders: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+    images_only: Option<bool>,
+) -> Result<SearchColdHotBenchmarkResult, String> {
+    let clean_query = query.trim();
+    if clean_query.is_empty() {
+        return Err("La consulta de benchmark no puede estar vacía".to_string());
+    }
+
+    let config = state
+        .ai_config
+        .lock()
+        .ok()
+        .and_then(|value| value.as_ref().cloned())
+        .ok_or_else(|| "Configura proveedor de embeddings para benchmark cold/hot".to_string())?;
+
+    let loops = iterations.unwrap_or(6).clamp(2, 20);
+    let cap = candidate_limit.unwrap_or(60).clamp(20, 160);
+    let search_roots = resolve_roots(roots);
+    let exclusions = normalize_extensions(excluded_extensions);
+    let folder_exclusions = normalize_folder_rules(excluded_folders);
+    let max_file_size_bytes = max_size_bytes(max_file_size_mb);
+    let images_only = images_only.unwrap_or(false);
+
+    let (candidates, backend) = match load_chunk_candidates_from_lancedb(
+        &app,
+        clean_query,
+        &search_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+        cap,
+        images_only,
+    )
+    .await
+    {
+        Ok(value) if !value.is_empty() => (value, "lancedb".to_string()),
+        _ => (
+            load_chunk_candidates(
+                &app,
+                clean_query,
+                &search_roots,
+                &exclusions,
+                &folder_exclusions,
+                max_file_size_bytes,
+                cap,
+                images_only,
+            )?,
+            "sqlite-fallback".to_string(),
+        ),
+    };
+
+    if candidates.is_empty() {
+        return Err("No hay candidatos para benchmark cold/hot".to_string());
+    }
+
+    let mut inputs = Vec::with_capacity(candidates.len() + 1);
+    inputs.push(clean_query.to_string());
+    for candidate in &candidates {
+        inputs.push(candidate.chunk_text.chars().take(1_200).collect::<String>());
+    }
+
+    let mut cold_ms = Vec::<u64>::with_capacity(loops);
+    let mut hot_ms = Vec::<u64>::with_capacity(loops);
+
+    for _ in 0..loops {
+        if let Ok(mut cache) = state.text_embedding_cache.lock() {
+            cache.clear();
+        }
+
+        let cold_started = Instant::now();
+        let _ = request_embeddings(state.inner(), &config, &inputs).await?;
+        cold_ms.push(cold_started.elapsed().as_millis() as u64);
+
+        let hot_started = Instant::now();
+        let _ = request_embeddings(state.inner(), &config, &inputs).await?;
+        hot_ms.push(hot_started.elapsed().as_millis() as u64);
+    }
+
+    let cold_avg = compute_avg_from_samples(&cold_ms);
+    let hot_avg = compute_avg_from_samples(&hot_ms);
+    let cold_p95 = percentile_ms(&cold_ms, 0.95);
+    let hot_p95 = percentile_ms(&hot_ms, 0.95);
+    let speedup = if cold_avg <= 0.0 {
+        0.0
+    } else {
+        ((cold_avg - hot_avg) / cold_avg * 100.0).max(0.0)
+    };
+
+    append_audit_log(
+        state.inner(),
+        "benchmark.semantic.cold_hot",
+        format!(
+            "iterations={} cold_avg={:.2} hot_avg={:.2} speedup={:.1}% backend={}",
+            loops, cold_avg, hot_avg, speedup, backend
+        ),
+    );
+
+    Ok(SearchColdHotBenchmarkResult {
+        query: clean_query.to_string(),
+        iterations: loops,
+        cold_avg_ms: cold_avg,
+        cold_p95_ms: cold_p95,
+        hot_avg_ms: hot_avg,
+        hot_p95_ms: hot_p95,
+        speedup_percent: speedup,
+        candidate_count: candidates.len(),
+        backend,
+    })
+}
+
+#[tauri::command]
+fn get_clip_image_cache_status(state: State<'_, AppState>) -> ClipImageCacheStatus {
+    let items = state
+        .clip_image_cache
+        .lock()
+        .map(|cache| cache.len())
+        .unwrap_or(0);
+    ClipImageCacheStatus { items }
+}
+
+#[tauri::command]
+fn clear_clip_image_cache(state: State<'_, AppState>) -> Result<(), String> {
+    if let Ok(mut cache) = state.clip_image_cache.lock() {
+        cache.clear();
+    }
+
+    append_audit_log(state.inner(), "clip.cache.clear", "cache visual limpiada".to_string());
+    Ok(())
 }
 
 #[tauri::command]
@@ -4276,6 +4478,26 @@ fn compute_avg_ms(total_ms: u64, calls: u64) -> f32 {
     total_ms as f32 / calls as f32
 }
 
+fn compute_avg_from_samples(samples: &[u64]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.iter().copied().sum::<u64>() as f32 / samples.len() as f32
+}
+
+fn percentile_ms(samples: &[u64], percentile: f32) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+
+    let mut ordered = samples.to_vec();
+    ordered.sort_unstable();
+    let idx = ((ordered.len() as f32 * percentile).ceil() as usize)
+        .saturating_sub(1)
+        .min(ordered.len().saturating_sub(1));
+    ordered[idx]
+}
+
 fn compute_hit_rate(hits: u64, misses: u64) -> f32 {
     let total = hits.saturating_add(misses);
     if total == 0 {
@@ -4485,7 +4707,11 @@ pub fn run() {
             get_embedding_cache_status,
             clear_embedding_cache,
             get_hardware_profile,
+            apply_hardware_profile_defaults,
             run_local_semantic_benchmark,
+            run_semantic_cold_hot_benchmark,
+            get_clip_image_cache_status,
+            clear_clip_image_cache,
             get_audit_logs,
             clear_audit_logs,
             export_audit_logs_to_file,
