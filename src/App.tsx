@@ -95,6 +95,14 @@ type FileVisualPreview = {
   reason: string | null;
 };
 
+type ScanTypeKey = "image" | "text" | "document";
+
+const FILE_TYPE_GROUPS: Record<ScanTypeKey, string[]> = {
+  image: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "svg", "heic", "heif"],
+  text: ["txt", "md", "markdown", "csv", "log", "json", "yaml", "yml", "toml", "ini"],
+  document: ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf", "odt"],
+};
+
 type RagSourceItem = {
   ref_id: string;
   title: string;
@@ -204,6 +212,7 @@ type PerformanceTelemetry = {
   memory_total_gb: number;
   memory_available_gb: number;
   memory_pressure_pct: number;
+  cpu_usage_pct: number;
   pressure_level: string;
   semantic_last_ms: number;
   rag_last_ms: number;
@@ -265,6 +274,7 @@ function App() {
   const [indexProgress, setIndexProgress] = useState<IndexProgressEvent | null>(null);
   const [indexDiagnostics, setIndexDiagnostics] = useState<IndexDiagnostics | null>(null);
   const [aiProviderStatus, setAiProviderStatus] = useState<AiProviderStatus | null>(null);
+  const [aiProviderMode, setAiProviderMode] = useState("openrouter-compatible");
   const [aiApiKey, setAiApiKey] = useState("");
   const [aiModel, setAiModel] = useState("text-embedding-3-small");
   const [aiBaseUrl, setAiBaseUrl] = useState("https://openrouter.ai/api/v1/embeddings");
@@ -274,6 +284,11 @@ function App() {
   const [watcherStatus, setWatcherStatus] = useState<FileWatcherStatus | null>(null);
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
   const [watcherDebounceMs, setWatcherDebounceMs] = useState("1200");
+  const [scanTypeSelection, setScanTypeSelection] = useState<Record<ScanTypeKey, boolean>>({
+    image: true,
+    text: true,
+    document: true,
+  });
   const [imagesOnly, setImagesOnly] = useState(false);
   const [isMaintenanceBusy, setIsMaintenanceBusy] = useState(false);
   const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
@@ -342,6 +357,7 @@ function App() {
     try {
       const status = await invoke<AiProviderStatus>("get_ai_provider_status");
       setAiProviderStatus(status);
+      setAiProviderMode(status.provider || "openrouter-compatible");
       setAiModel(status.embedding_model);
       setAiBaseUrl(status.base_url);
       setAiChatModel(status.chat_model);
@@ -1003,6 +1019,36 @@ function App() {
     }
   };
 
+  const getInvokeErrorMessage = (error: unknown, fallback: string) => {
+    if (typeof error === "string" && error.trim()) {
+      return error;
+    }
+
+    if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+      return error.message;
+    }
+
+    return fallback;
+  };
+
+  const hasAnyScanTypeSelected = Object.values(scanTypeSelection).some(Boolean);
+
+  const buildExcludedExtensionsFromScanTypes = () => {
+    const excluded = new Set<string>();
+
+    if (!scanTypeSelection.image) {
+      FILE_TYPE_GROUPS.image.forEach((ext) => excluded.add(ext));
+    }
+    if (!scanTypeSelection.text) {
+      FILE_TYPE_GROUPS.text.forEach((ext) => excluded.add(ext));
+    }
+    if (!scanTypeSelection.document) {
+      FILE_TYPE_GROUPS.document.forEach((ext) => excluded.add(ext));
+    }
+
+    return Array.from(excluded);
+  };
+
   const pickFolders = async () => {
     const selected = await openDialog({
       directory: true,
@@ -1140,10 +1186,12 @@ function App() {
     });
 
     try {
-      const exclusions = excludedExtensions
-        .split(",")
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0);
+      if (!hasAnyScanTypeSelected) {
+        setIndexFeedback({ type: "error", text: "Selecciona al menos un tipo: imagen, texto o documento" });
+        return;
+      }
+
+      const exclusions = buildExcludedExtensionsFromScanTypes();
 
       const excludedFolderRules = excludedFolders
         .split(",")
@@ -1215,7 +1263,7 @@ function App() {
   };
 
   const saveAiProvider = async () => {
-    if (!aiApiKey.trim()) {
+    if (aiProviderMode !== "ollama-local" && !aiApiKey.trim()) {
       setErrorMessage("Debes ingresar una API key para guardar la config de IA.");
       return;
     }
@@ -1225,6 +1273,7 @@ function App() {
 
     try {
       const status = await invoke<AiProviderStatus>("configure_ai_provider", {
+        provider: aiProviderMode,
         apiKey: aiApiKey,
         embeddingModel: aiModel,
         baseUrl: aiBaseUrl,
@@ -1233,10 +1282,11 @@ function App() {
       });
 
       setAiProviderStatus(status);
+      setAiProviderMode(status.provider);
       setAiApiKey("");
       setIndexFeedback({ type: "success", text: "IA configurada" });
-    } catch {
-      setIndexFeedback({ type: "error", text: "No se pudo guardar IA" });
+    } catch (error) {
+      setIndexFeedback({ type: "error", text: getInvokeErrorMessage(error, "No se pudo guardar IA") });
     } finally {
       setIsSavingAi(false);
     }
@@ -1246,10 +1296,12 @@ function App() {
     setIsWatcherLoading(true);
 
     try {
-      const exclusions = excludedExtensions
-        .split(",")
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0);
+      if (!hasAnyScanTypeSelected) {
+        setIndexFeedback({ type: "error", text: "Selecciona al menos un tipo: imagen, texto o documento" });
+        return;
+      }
+
+      const exclusions = buildExcludedExtensionsFromScanTypes();
 
       const excludedFolderRules = excludedFolders
         .split(",")
@@ -1272,8 +1324,8 @@ function App() {
       setWatcherStatus(status);
       setWatcherDebounceMs(String(status.debounce_ms));
       setIndexFeedback({ type: "success", text: "Watcher activo" });
-    } catch {
-      setIndexFeedback({ type: "error", text: "No se pudo iniciar watcher" });
+    } catch (error) {
+      setIndexFeedback({ type: "error", text: getInvokeErrorMessage(error, "No se pudo iniciar watcher") });
     } finally {
       setIsWatcherLoading(false);
     }
@@ -1286,8 +1338,8 @@ function App() {
       const status = await invoke<FileWatcherStatus>("stop_file_watcher");
       setWatcherStatus(status);
       setIndexFeedback({ type: "success", text: "Watcher detenido" });
-    } catch {
-      setIndexFeedback({ type: "error", text: "No se pudo detener watcher" });
+    } catch (error) {
+      setIndexFeedback({ type: "error", text: getInvokeErrorMessage(error, "No se pudo detener watcher") });
     } finally {
       setIsWatcherLoading(false);
     }
@@ -1300,8 +1352,8 @@ function App() {
       const status = await invoke<FileWatcherStatus>("clear_file_watcher_error");
       setWatcherStatus(status);
       setIndexFeedback({ type: "success", text: "Error watcher limpiado" });
-    } catch {
-      setIndexFeedback({ type: "error", text: "No se pudo limpiar error watcher" });
+    } catch (error) {
+      setIndexFeedback({ type: "error", text: getInvokeErrorMessage(error, "No se pudo limpiar error watcher") });
     } finally {
       setIsWatcherLoading(false);
     }
@@ -1315,12 +1367,51 @@ function App() {
       setWatcherStatus(status);
       setIndexFeedback({ type: "success", text: "Reindex manual por watcher completado" });
       await refreshStatus();
-    } catch {
-      setIndexFeedback({ type: "error", text: "No se pudo forzar reindex del watcher" });
+    } catch (error) {
+      setIndexFeedback({ type: "error", text: getInvokeErrorMessage(error, "No se pudo forzar reindex del watcher") });
     } finally {
       setIsWatcherLoading(false);
     }
   };
+
+  const _minimalUiKeepAlive = [
+    setExcludedExtensions,
+    setExcludedFolders,
+    isSavingAi,
+    isWatcherLoading,
+    auditLogs,
+    isAuditLoading,
+    isClipSaving,
+    embeddingCacheStatus,
+    hardwareProfile,
+    setBenchmarkQuery,
+    setBenchmarkIterations,
+    isBenchmarking,
+    benchmarkResult,
+    isApplyingPerfProfile,
+    coldHotResult,
+    isColdHotBenchmarking,
+    clipImageCacheStatus,
+    isPerformanceRuntimeSaving,
+    toggleAdaptiveRuntime,
+    clearAuditLogs,
+    exportAuditLogs,
+    saveClipConfig,
+    clearEmbeddingCache,
+    runLocalBenchmark,
+    applyPerformanceProfile,
+    runColdHotBenchmark,
+    clearClipImageCache,
+    resetIndexData,
+    exportConfigToJson,
+    importConfigFromJson,
+    saveAiProvider,
+    startWatcher,
+    stopWatcher,
+    clearWatcherError,
+    triggerWatcherReindex,
+  ];
+  void _minimalUiKeepAlive;
 
   const formatIndexedAt = (value: string | null) => {
     if (!value) {
@@ -1526,12 +1617,12 @@ function App() {
         <div className="mb-3 flex items-center justify-end">
           <button
             type="button"
-            className="rounded-lg bg-white/10 p-2 text-gray-200 transition-colors hover:bg-white/20"
+            className="rounded-md bg-white/10 p-1.5 text-gray-300 transition-colors hover:bg-white/20"
             title="Configuración"
             aria-label="Abrir configuración"
             onClick={() => setIsConfigOpen(true)}
           >
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0-1 .6 1.65 1.65 0 0 0-.33 1V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-.33-1A1.65 1.65 0 0 0 8 19.4a1.65 1.65 0 0 0-1-.6 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-.6-1 1.65 1.65 0 0 0-1-.33H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1-.33A1.65 1.65 0 0 0 4.6 8a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 8 4.6a1.65 1.65 0 0 0 1-.6 1.65 1.65 0 0 0 .33-1V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 .33 1A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1 .6 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 8a1.65 1.65 0 0 0 .6 1 1.65 1.65 0 0 0 1 .33H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1 .33 1.65 1.65 0 0 0-.51 1.34Z"/></svg>
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0-1 .6 1.65 1.65 0 0 0-.33 1V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-.33-1A1.65 1.65 0 0 0 8 19.4a1.65 1.65 0 0 0-1-.6 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-.6-1 1.65 1.65 0 0 0-1-.33H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1-.33A1.65 1.65 0 0 0 4.6 8a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 8 4.6a1.65 1.65 0 0 0 1-.6 1.65 1.65 0 0 0 .33-1V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 .33 1A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1 .6 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 8a1.65 1.65 0 0 0 .6 1 1.65 1.65 0 0 0 1 .33H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1 .33 1.65 1.65 0 0 0-.51 1.34Z"/></svg>
           </button>
         </div>
 
@@ -1738,7 +1829,7 @@ function App() {
             </p>
             {performanceTelemetry && (
               <p className="mt-1 text-[11px] text-gray-500">
-                Memoria {performanceTelemetry.memory_available_gb.toFixed(1)}/{performanceTelemetry.memory_total_gb.toFixed(1)} GB libres · presión {performanceTelemetry.memory_pressure_pct.toFixed(1)}% ({performanceTelemetry.pressure_level}) · throttle x{performanceTelemetry.throttling_factor.toFixed(2)}
+                Memoria {performanceTelemetry.memory_available_gb.toFixed(1)}/{performanceTelemetry.memory_total_gb.toFixed(1)} GB libres · presión {performanceTelemetry.memory_pressure_pct.toFixed(1)}% ({performanceTelemetry.pressure_level}) · CPU {performanceTelemetry.cpu_usage_pct.toFixed(1)}% · throttle x{performanceTelemetry.throttling_factor.toFixed(2)}
               </p>
             )}
             {semanticSchemaInfo && (
@@ -2233,7 +2324,7 @@ function App() {
               </div>
 
               <div className="mt-4 space-y-4">
-                <div className="space-y-2">
+                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-xs uppercase tracking-wide text-gray-500">Carpetas a indexar</p>
                     <button
@@ -2248,7 +2339,7 @@ function App() {
                   </div>
 
                   {searchRoots.length > 0 ? (
-                    <div className="flex flex-wrap gap-2">
+                    <div className="mt-2 flex flex-wrap gap-2">
                       {searchRoots.map((root) => (
                         <button
                           key={root}
@@ -2262,355 +2353,44 @@ function App() {
                       ))}
                     </div>
                   ) : (
-                    <p className="text-xs text-gray-500">Sin carpetas seleccionadas: por defecto se usan Documents/Desktop/Downloads.</p>
+                    <p className="mt-2 text-xs text-gray-500">Sin carpetas seleccionadas: se usan Documents/Pictures/Downloads.</p>
                   )}
                 </div>
 
-                <div className="space-y-1">
-                  <label className="text-[11px] text-gray-500" htmlFor="excluded-exts">
-                    Excluir extensiones (coma separada)
-                  </label>
-                  <input
-                    id="excluded-exts"
-                    type="text"
-                    className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                    placeholder="mkv, mp4, zip"
-                    value={excludedExtensions}
-                    onChange={(e) => setExcludedExtensions(e.target.value)}
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-[11px] text-gray-500" htmlFor="excluded-folders">
-                    Excluir carpetas por nombre (coma separada)
-                  </label>
-                  <input
-                    id="excluded-folders"
-                    type="text"
-                    className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                    placeholder="node_modules, .git, target"
-                    value={excludedFolders}
-                    onChange={(e) => setExcludedFolders(e.target.value)}
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-[11px] text-gray-500" htmlFor="max-size-mb">
-                    Tamaño máximo por archivo (MB)
-                  </label>
-                  <input
-                    id="max-size-mb"
-                    type="number"
-                    min={1}
-                    className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                    value={maxFileSizeMb}
-                    onChange={(e) => setMaxFileSizeMb(e.target.value)}
-                  />
-                </div>
-
                 <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
-                  <p className="text-xs uppercase tracking-wide text-gray-400">Embeddings IA (API)</p>
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    Activa ranking semántico real usando endpoint compatible OpenRouter/OpenAI.
-                  </p>
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Tipo de archivos</p>
+                  <p className="mt-1 text-[11px] text-gray-500">Selecciona qué categorías quieres escanear.</p>
 
-                  <div className="mt-3 space-y-2">
-                    <div className="space-y-1">
-                      <label className="text-[11px] text-gray-500" htmlFor="ai-api-key">
-                        API key
-                      </label>
-                      <input
-                        id="ai-api-key"
-                        type="password"
-                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                        placeholder="sk-or-v1-..."
-                        value={aiApiKey}
-                        onChange={(e) => setAiApiKey(e.target.value)}
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <label className="text-[11px] text-gray-500" htmlFor="ai-model">
-                        Modelo de embedding
-                      </label>
-                      <input
-                        id="ai-model"
-                        type="text"
-                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                        placeholder="text-embedding-3-small"
-                        value={aiModel}
-                        onChange={(e) => setAiModel(e.target.value)}
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <label className="text-[11px] text-gray-500" htmlFor="ai-base-url">
-                        Endpoint embeddings
-                      </label>
-                      <input
-                        id="ai-base-url"
-                        type="text"
-                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                        placeholder="https://openrouter.ai/api/v1/embeddings"
-                        value={aiBaseUrl}
-                        onChange={(e) => setAiBaseUrl(e.target.value)}
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <label className="text-[11px] text-gray-500" htmlFor="ai-chat-model">
-                        Modelo de chat
-                      </label>
-                      <input
-                        id="ai-chat-model"
-                        type="text"
-                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                        placeholder="gpt-4o-mini"
-                        value={aiChatModel}
-                        onChange={(e) => setAiChatModel(e.target.value)}
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <label className="text-[11px] text-gray-500" htmlFor="ai-chat-base-url">
-                        Endpoint chat
-                      </label>
-                      <input
-                        id="ai-chat-base-url"
-                        type="text"
-                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                        placeholder="https://openrouter.ai/api/v1/chat/completions"
-                        value={aiChatBaseUrl}
-                        onChange={(e) => setAiChatBaseUrl(e.target.value)}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="mt-3 flex items-center gap-2">
-                    <button
-                      type="button"
-                      className="rounded-md bg-indigo-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-indigo-500"
-                      disabled={isSavingAi}
-                      onClick={() => {
-                        void saveAiProvider();
-                      }}
-                    >
-                      {isSavingAi ? "Guardando..." : "Guardar IA"}
-                    </button>
-
-                    {aiProviderStatus?.configured && (
-                      <span className="text-[11px] text-emerald-300">
-                        Configurada ({aiProviderStatus.api_key_hint ?? "key oculta"})
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
-                  <p className="text-xs uppercase tracking-wide text-gray-400">File Watcher (tiempo real)</p>
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    Vigila cambios en disco y dispara reindexado automático con debounce.
-                  </p>
-
-                  <div className="mt-3 flex flex-wrap items-center gap-2">
-                    <div className="mr-1 flex items-center gap-2 rounded-md bg-black/20 px-2 py-1 ring-1 ring-white/10">
-                      <label className="text-[10px] text-gray-400" htmlFor="watcher-debounce-ms">Debounce ms</label>
-                      <input
-                        id="watcher-debounce-ms"
-                        type="number"
-                        min={300}
-                        max={30000}
-                        className="w-16 border-0 bg-transparent text-[10px] text-gray-200 outline-none"
-                        value={watcherDebounceMs}
-                        onChange={(e) => setWatcherDebounceMs(e.target.value)}
-                      />
-                    </div>
-
-                    <button
-                      type="button"
-                      className="rounded-md bg-blue-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-blue-500"
-                      disabled={isWatcherLoading || Boolean(watcherStatus?.running)}
-                      onClick={() => {
-                        void startWatcher();
-                      }}
-                    >
-                      {isWatcherLoading && !watcherStatus?.running ? "Iniciando..." : "Iniciar watcher"}
-                    </button>
-
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      disabled={isWatcherLoading || !watcherStatus?.running}
-                      onClick={() => {
-                        void stopWatcher();
-                      }}
-                    >
-                      {isWatcherLoading && watcherStatus?.running ? "Deteniendo..." : "Detener watcher"}
-                    </button>
-
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      disabled={isWatcherLoading || !watcherStatus?.running}
-                      onClick={() => {
-                        void triggerWatcherReindex();
-                      }}
-                    >
-                      Reindex ahora
-                    </button>
-
-                    <button
-                      type="button"
-                      className="rounded-md bg-amber-500/20 px-3 py-1.5 text-xs text-amber-200 transition-colors hover:bg-amber-500/30"
-                      disabled={isWatcherLoading || !watcherStatus?.last_error}
-                      onClick={() => {
-                        void clearWatcherError();
-                      }}
-                    >
-                      Limpiar error
-                    </button>
-
-                    <span className="text-[11px] text-gray-400">
-                      Estado: {watcherStatus?.running ? "activo" : "detenido"}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
-                  <p className="text-xs uppercase tracking-wide text-gray-400">Rendimiento adaptativo</p>
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    Perfil hardware + caché de embeddings + benchmark local para ajustar rendimiento.
-                  </p>
-
-                  {performanceRuntimeStatus && (
-                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className={`rounded px-2 py-0.5 text-[10px] ${performanceRuntimeStatus.adaptive_enabled ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"}`}>
-                          {performanceRuntimeStatus.adaptive_enabled ? "AUTOAJUSTE ON" : "AUTOAJUSTE OFF"}
-                        </span>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {(
+                      [
+                        { key: "image", label: "Imagen" },
+                        { key: "text", label: "Texto" },
+                        { key: "document", label: "Documento" },
+                      ] as Array<{ key: ScanTypeKey; label: string }>
+                    ).map((item) => {
+                      const enabled = scanTypeSelection[item.key];
+                      return (
                         <button
+                          key={item.key}
                           type="button"
-                          className="rounded-md bg-white/10 px-2 py-0.5 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
-                          disabled={isPerformanceRuntimeSaving}
+                          className={`rounded-md px-3 py-1.5 text-xs transition-colors ring-1 ${
+                            enabled
+                              ? "bg-emerald-500/20 text-emerald-200 ring-emerald-400/30"
+                              : "bg-white/5 text-gray-400 ring-white/10 hover:bg-white/10"
+                          }`}
                           onClick={() => {
-                            void toggleAdaptiveRuntime();
+                            setScanTypeSelection((prev) => ({ ...prev, [item.key]: !prev[item.key] }));
                           }}
                         >
-                          {isPerformanceRuntimeSaving ? "Guardando..." : "Cambiar"}
+                          {item.label}
                         </button>
-                      </div>
-                      <p className="mt-1 text-[10px] text-gray-500">último candidate limit: {performanceRuntimeStatus.last_candidate_limit} · último rag k: {performanceRuntimeStatus.last_rag_top_k}</p>
-                      <p className="mt-1 truncate text-[10px] text-gray-500">{performanceRuntimeStatus.last_decision}</p>
-                      {performanceTelemetry && (
-                        <p className="mt-1 text-[10px] text-gray-500">
-                          telemetría live · presión {performanceTelemetry.memory_pressure_pct.toFixed(1)}% ({performanceTelemetry.pressure_level}) · libres {performanceTelemetry.memory_available_gb.toFixed(1)} GB · throttle x{performanceTelemetry.throttling_factor.toFixed(2)}
-                        </p>
-                      )}
-                    </div>
-                  )}
-
-                  {hardwareProfile && (
-                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
-                      <p className="text-[11px] text-gray-300">
-                        CPU {hardwareProfile.cpu_cores} hilos · RAM {hardwareProfile.total_memory_gb.toFixed(1)} GB
-                      </p>
-                      <p className="mt-1 truncate text-[10px] text-gray-500">{hardwareProfile.cpu_brand}</p>
-                      <p className="mt-1 text-[10px] text-gray-400">
-                        Recomendado: modo {hardwareProfile.recommended_mode.toUpperCase()} · top-k {hardwareProfile.recommended_top_k} · max file {hardwareProfile.recommended_max_file_size_mb} MB
-                      </p>
-                      <p className="mt-1 text-[10px] text-gray-500">{hardwareProfile.note}</p>
-                      <button
-                        type="button"
-                        className="mt-2 rounded-md bg-emerald-500/25 px-2.5 py-1 text-[11px] text-emerald-200 transition-colors hover:bg-emerald-500/35"
-                        disabled={isApplyingPerfProfile}
-                        onClick={() => {
-                          void applyPerformanceProfile();
-                        }}
-                      >
-                        {isApplyingPerfProfile ? "Aplicando..." : "Aplicar perfil recomendado"}
-                      </button>
-                    </div>
-                  )}
-
-                  {embeddingCacheStatus && (
-                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
-                      <p className="text-[11px] text-gray-300">
-                        Caché embeddings: {embeddingCacheStatus.items} items · hits {embeddingCacheStatus.hits} · misses {embeddingCacheStatus.misses}
-                      </p>
-                      <p className="mt-1 text-[10px] text-gray-500">Hit rate: {embeddingCacheStatus.hit_rate.toFixed(1)}%</p>
-                      <button
-                        type="button"
-                        className="mt-2 rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
-                        onClick={() => {
-                          void clearEmbeddingCache();
-                        }}
-                      >
-                        Limpiar caché embeddings
-                      </button>
-                    </div>
-                  )}
-
-                  <div className="mt-3 space-y-2">
-                    <input
-                      type="text"
-                      className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                      placeholder="Consulta benchmark"
-                      value={benchmarkQuery}
-                      onChange={(e) => setBenchmarkQuery(e.target.value)}
-                    />
-
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        min={3}
-                        max={40}
-                        className="w-24 appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                        value={benchmarkIterations}
-                        onChange={(e) => setBenchmarkIterations(e.target.value)}
-                      />
-                      <button
-                        type="button"
-                        className="rounded-md bg-cyan-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-cyan-500"
-                        disabled={isBenchmarking}
-                        onClick={() => {
-                          void runLocalBenchmark();
-                        }}
-                      >
-                        {isBenchmarking ? "Benchmark..." : "Correr benchmark local"}
-                      </button>
-                      <button
-                        type="button"
-                        className="rounded-md bg-indigo-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-indigo-500"
-                        disabled={isColdHotBenchmarking}
-                        onClick={() => {
-                          void runColdHotBenchmark();
-                        }}
-                      >
-                        {isColdHotBenchmarking ? "Cold/Hot..." : "Benchmark cold/hot"}
-                      </button>
-                    </div>
+                      );
+                    })}
                   </div>
 
-                  {benchmarkResult && (
-                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
-                      <p className="text-[11px] text-gray-300">
-                        {benchmarkResult.backend} · {benchmarkResult.iterations} iter · avg {benchmarkResult.avg_ms.toFixed(1)} ms · p95 {benchmarkResult.p95_ms} ms
-                      </p>
-                      <p className="mt-1 text-[10px] text-gray-500">
-                        best {benchmarkResult.best_ms} ms · worst {benchmarkResult.worst_ms} ms · resultados {benchmarkResult.last_result_count}
-                      </p>
-                    </div>
-                  )}
-
-                  {coldHotResult && (
-                    <div className="mt-2 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
-                      <p className="text-[11px] text-gray-300">
-                        cold avg {coldHotResult.cold_avg_ms.toFixed(1)} ms (p95 {coldHotResult.cold_p95_ms}) · hot avg {coldHotResult.hot_avg_ms.toFixed(1)} ms (p95 {coldHotResult.hot_p95_ms})
-                      </p>
-                      <p className="mt-1 text-[10px] text-gray-500">
-                        speedup cache {coldHotResult.speedup_percent.toFixed(1)}% · candidatos {coldHotResult.candidate_count} · {coldHotResult.backend}
-                      </p>
-                    </div>
+                  {!hasAnyScanTypeSelected && (
+                    <p className="mt-2 text-[11px] text-amber-300">Selecciona al menos un tipo para poder indexar.</p>
                   )}
                 </div>
 
@@ -2618,235 +2398,20 @@ function App() {
                   <button
                     type="button"
                     className="rounded-md bg-blue-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-blue-500"
-                    disabled={isIndexing}
+                    disabled={isIndexing || !hasAnyScanTypeSelected}
                     onClick={() => {
-                      void startIndexing(["C:\\"]);
+                      void startIndexing(searchRoots.length > 0 ? searchRoots : ["C:\\"]);
                     }}
                   >
-                    {isIndexing ? "Indexando..." : "Indexar todo C:"}
+                    {isIndexing ? "Indexando..." : "Reindexar"}
                   </button>
                   <button
                     type="button"
                     className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                    disabled={isIndexing || searchRoots.length === 0}
-                    onClick={() => {
-                      void startIndexing(searchRoots);
-                    }}
+                    onClick={() => setIsConfigOpen(false)}
                   >
-                    Indexar selección
+                    Listo
                   </button>
-                </div>
-
-                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
-                  <p className="text-xs uppercase tracking-wide text-gray-400">Mantenimiento y respaldo</p>
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    Exporta/importa configuración y gestiona limpieza total del índice local.
-                  </p>
-
-                  <div className="mt-3 flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      disabled={isMaintenanceBusy}
-                      onClick={() => {
-                        void exportConfigToJson();
-                      }}
-                    >
-                      Exportar config
-                    </button>
-
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      disabled={isMaintenanceBusy}
-                      onClick={() => {
-                        void importConfigFromJson();
-                      }}
-                    >
-                      Importar config
-                    </button>
-
-                    <button
-                      type="button"
-                      className="rounded-md bg-red-500/20 px-3 py-1.5 text-xs text-red-300 ring-1 ring-red-400/30 transition-colors hover:bg-red-500/30"
-                      disabled={isMaintenanceBusy || isIndexing}
-                      onClick={() => {
-                        void resetIndexData();
-                      }}
-                    >
-                      Reset índice local
-                    </button>
-                  </div>
-                </div>
-
-                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
-                  <p className="text-xs uppercase tracking-wide text-gray-400">Privacidad y auditoría</p>
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    Política: el contenido se indexa localmente por defecto. Solo se usa cloud cuando activas IA y eliges modo CLOUD/AUTO.
-                  </p>
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    Los logs de auditoría guardan eventos técnicos (sin exponer API keys completas) para diagnóstico.
-                  </p>
-
-                  <div className="mt-3 flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      disabled={isAuditLoading}
-                      onClick={() => {
-                        void refreshAuditLogs();
-                      }}
-                    >
-                      Refrescar logs
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      disabled={isAuditLoading}
-                      onClick={() => {
-                        void exportAuditLogs();
-                      }}
-                    >
-                      Exportar logs
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      disabled={isAuditLoading}
-                      onClick={() => {
-                        void clearAuditLogs();
-                      }}
-                    >
-                      Limpiar logs
-                    </button>
-                  </div>
-
-                  <div className="mt-2 max-h-28 space-y-1 overflow-y-auto rounded-md bg-black/20 p-2 ring-1 ring-white/10">
-                    {auditLogs.length === 0 ? (
-                      <p className="text-[10px] text-gray-500">Sin eventos de auditoría.</p>
-                    ) : (
-                      auditLogs.map((entry, index) => (
-                        <p key={`${entry.timestamp}-${entry.event}-${index}`} className="text-[10px] text-gray-400">
-                          [{entry.timestamp}] {entry.event} · {entry.detail}
-                        </p>
-                      ))
-                    )}
-                  </div>
-                </div>
-
-                <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
-                  <p className="text-xs uppercase tracking-wide text-gray-400">CLIP / ONNX (local)</p>
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    Configura modelos ONNX de texto e imagen + tokenizer para búsqueda semántica texto→imagen local.
-                  </p>
-
-                  <div className="mt-3 space-y-2">
-                    <input
-                      type="text"
-                      className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                      placeholder="Ruta modelo imagen ONNX"
-                      value={clipImageModelPath}
-                      onChange={(e) => setClipImageModelPath(e.target.value)}
-                    />
-                    <input
-                      type="text"
-                      className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                      placeholder="Ruta modelo texto ONNX"
-                      value={clipTextModelPath}
-                      onChange={(e) => setClipTextModelPath(e.target.value)}
-                    />
-                    <input
-                      type="text"
-                      className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                      placeholder="Ruta tokenizer.json"
-                      value={clipTokenizerPath}
-                      onChange={(e) => setClipTokenizerPath(e.target.value)}
-                    />
-
-                    <div className="grid grid-cols-2 gap-2">
-                      <input
-                        type="number"
-                        min={128}
-                        max={512}
-                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                        placeholder="Input size"
-                        value={clipInputSize}
-                        onChange={(e) => setClipInputSize(e.target.value)}
-                      />
-                      <input
-                        type="number"
-                        min={16}
-                        max={256}
-                        className="w-full appearance-none rounded-md border-0 bg-white/5 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-500 outline-none focus:bg-white/10"
-                        placeholder="Max length"
-                        value={clipMaxLength}
-                        onChange={(e) => setClipMaxLength(e.target.value)}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="mt-3 flex items-center gap-2">
-                    <button
-                      type="button"
-                      className="rounded-md bg-violet-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-violet-500"
-                      disabled={isClipSaving}
-                      onClick={() => {
-                        void saveClipConfig();
-                      }}
-                    >
-                      {isClipSaving ? "Guardando..." : "Guardar CLIP"}
-                    </button>
-
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      disabled={isClipValidating}
-                      onClick={() => {
-                        void validateClipSetup();
-                      }}
-                    >
-                      {isClipValidating ? "Validando..." : "Verificar CLIP"}
-                    </button>
-
-                    {clipStatus?.configured && (
-                      <span className={`text-[11px] ${clipStatus.enabled ? "text-emerald-300" : "text-amber-300"}`}>
-                        {clipStatus.enabled ? "CLIP activo" : "CLIP inactivo"}
-                      </span>
-                    )}
-
-                    <button
-                      type="button"
-                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
-                      onClick={() => {
-                        void clearClipImageCache();
-                      }}
-                    >
-                      Limpiar cache CLIP
-                    </button>
-
-                    {clipImageCacheStatus && (
-                      <span className="text-[11px] text-gray-400">cache img: {clipImageCacheStatus.items}</span>
-                    )}
-                  </div>
-
-                  {clipValidation && (
-                    <div className="mt-3 rounded-md bg-black/20 p-2 ring-1 ring-white/10">
-                      <p className="text-[11px] text-gray-300">{clipValidation.message}</p>
-                      <p className="mt-1 text-[10px] text-gray-500">
-                        tokenizer: {clipValidation.tokenizer_ok ? "OK" : "FAIL"} · text model: {clipValidation.text_model_ok ? "OK" : "FAIL"} · image model: {clipValidation.image_model_ok ? "OK" : "FAIL"}
-                      </p>
-                      <p className="mt-1 text-[10px] text-gray-500">
-                        infer texto: {clipValidation.text_inference_ok ? "OK" : "FAIL"}
-                        {clipValidation.text_dim ? ` (${clipValidation.text_dim} dim)` : ""}
-                        {" · "}
-                        infer imagen: {clipValidation.image_inference_ok ? "OK" : "PEND/FAIL"}
-                        {clipValidation.image_dim ? ` (${clipValidation.image_dim} dim)` : ""}
-                      </p>
-                      {clipValidation.sample_image_path && (
-                        <p className="mt-1 truncate text-[10px] text-gray-500">muestra: {clipValidation.sample_image_path}</p>
-                      )}
-                    </div>
-                  )}
                 </div>
               </div>
             </div>

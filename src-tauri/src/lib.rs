@@ -165,6 +165,7 @@ struct PerformanceTelemetry {
     memory_total_gb: f32,
     memory_available_gb: f32,
     memory_pressure_pct: f32,
+    cpu_usage_pct: f32,
     pressure_level: String,
     semantic_last_ms: u64,
     rag_last_ms: u64,
@@ -553,6 +554,7 @@ struct ChunkCandidate {
     path: String,
     chunk_text: String,
     lexical_score: f32,
+    modified_unix_secs: u64,
 }
 
 #[derive(Deserialize)]
@@ -804,6 +806,7 @@ fn get_performance_telemetry(state: State<'_, AppState>) -> PerformanceTelemetry
         memory_total_gb: snapshot.total_memory_gb,
         memory_available_gb: snapshot.available_memory_gb,
         memory_pressure_pct: snapshot.memory_pressure_pct,
+        cpu_usage_pct: runtime_cpu_usage_pct(),
         pressure_level,
         semantic_last_ms: metrics.last_semantic_ms,
         rag_last_ms: metrics.last_rag_ms,
@@ -1383,33 +1386,68 @@ fn trigger_watcher_reindex(app: tauri::AppHandle, state: State<'_, AppState>) ->
 fn configure_ai_provider(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+    provider: Option<String>,
     api_key: String,
     embedding_model: Option<String>,
     base_url: Option<String>,
     chat_model: Option<String>,
     chat_base_url: Option<String>,
 ) -> Result<AiProviderStatus, String> {
+    let provider = provider
+        .unwrap_or_else(|| "openrouter-compatible".to_string())
+        .trim()
+        .to_lowercase();
+    let is_local_provider = provider == "ollama-local";
+
     let trimmed_key = api_key.trim().to_string();
-    if trimmed_key.is_empty() {
+    if trimmed_key.is_empty() && !is_local_provider {
         return Err("API key vacía".to_string());
     }
 
     let config = AiProviderConfig {
-        provider: "openrouter-compatible".to_string(),
+        provider: if is_local_provider {
+            "ollama-local".to_string()
+        } else {
+            "openrouter-compatible".to_string()
+        },
         base_url: base_url
-            .unwrap_or_else(|| "https://openrouter.ai/api/v1/embeddings".to_string())
+            .unwrap_or_else(|| {
+                if is_local_provider {
+                    default_ollama_embeddings_url_value()
+                } else {
+                    "https://openrouter.ai/api/v1/embeddings".to_string()
+                }
+            })
             .trim()
             .to_string(),
         embedding_model: embedding_model
-            .unwrap_or_else(|| "text-embedding-3-small".to_string())
+            .unwrap_or_else(|| {
+                if is_local_provider {
+                    default_ollama_model_value()
+                } else {
+                    "text-embedding-3-small".to_string()
+                }
+            })
             .trim()
             .to_string(),
         chat_base_url: chat_base_url
-            .unwrap_or_else(|| "https://openrouter.ai/api/v1/chat/completions".to_string())
+            .unwrap_or_else(|| {
+                if is_local_provider {
+                    default_ollama_chat_url_value()
+                } else {
+                    "https://openrouter.ai/api/v1/chat/completions".to_string()
+                }
+            })
             .trim()
             .to_string(),
         chat_model: chat_model
-            .unwrap_or_else(|| "gpt-4o-mini".to_string())
+            .unwrap_or_else(|| {
+                if is_local_provider {
+                    default_ollama_chat_model_value()
+                } else {
+                    "gpt-4o-mini".to_string()
+                }
+            })
             .trim()
             .to_string(),
         api_key: trimmed_key,
@@ -1433,7 +1471,11 @@ fn configure_ai_provider(
             config.provider,
             config.embedding_model,
             config.chat_model,
-            mask_api_key(&config.api_key)
+            if config.api_key.is_empty() {
+                "sin-api-key".to_string()
+            } else {
+                mask_api_key(&config.api_key)
+            }
         ),
     );
 
@@ -1965,7 +2007,8 @@ async fn semantic_search(
 
             for (index, candidate) in candidates.drain(..).enumerate() {
                 let semantic = cosine_similarity(query_vector, &vectors[index + 1]);
-                let blended = semantic * 0.72 + candidate.lexical_score * 0.28;
+                let recency = compute_recency_signal(candidate.modified_unix_secs);
+                let blended = semantic * 0.66 + candidate.lexical_score * 0.26 + recency * 0.08;
                 scored.push((blended, candidate));
             }
 
@@ -4131,7 +4174,7 @@ fn load_chunk_candidates(
 
     let conn = open_semantic_connection(app)?;
     let mut sql = String::from(
-        "SELECT title, path, chunk_text, search_key, size_bytes FROM chunks",
+        "SELECT title, path, chunk_text, search_key, size_bytes, modified_unix_secs FROM chunks",
     );
 
     let clauses = tokens
@@ -4164,6 +4207,7 @@ fn load_chunk_candidates(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })
         .map_err(|err| format!("No se pudo ejecutar consulta de chunks: {err}"))?;
@@ -4172,8 +4216,9 @@ fn load_chunk_candidates(
     let mut by_path = HashMap::<String, ChunkCandidate>::new();
 
     for row in rows.flatten() {
-        let (title, path, chunk_text, search_key, size_bytes_raw) = row;
+        let (title, path, chunk_text, search_key, size_bytes_raw, modified_raw) = row;
         let size_bytes = size_bytes_raw.max(0) as u64;
+        let modified_unix_secs = modified_raw.max(0) as u64;
 
         if size_bytes > max_file_size_bytes {
             continue;
@@ -4206,6 +4251,7 @@ fn load_chunk_candidates(
                     path,
                     chunk_text,
                     lexical_score,
+                    modified_unix_secs,
                 },
             );
         }
@@ -4292,6 +4338,10 @@ async fn load_chunk_candidates_from_lancedb(
             .column_by_name("size_bytes")
             .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
             .ok_or_else(|| "LanceDB: columna size_bytes inválida".to_string())?;
+        let modified_col = batch
+            .column_by_name("modified_unix_secs")
+            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| "LanceDB: columna modified_unix_secs inválida".to_string())?;
 
         for row in 0..batch.num_rows() {
             if title_col.is_null(row)
@@ -4299,6 +4349,7 @@ async fn load_chunk_candidates_from_lancedb(
                 || chunk_text_col.is_null(row)
                 || search_key_col.is_null(row)
                 || size_col.is_null(row)
+                || modified_col.is_null(row)
             {
                 continue;
             }
@@ -4308,6 +4359,7 @@ async fn load_chunk_candidates_from_lancedb(
             let chunk_text = chunk_text_col.value(row).to_string();
             let search_key = search_key_col.value(row).to_string();
             let size_bytes = size_col.value(row).max(0) as u64;
+            let modified_unix_secs = modified_col.value(row).max(0) as u64;
 
             if size_bytes > max_file_size_bytes {
                 continue;
@@ -4340,6 +4392,7 @@ async fn load_chunk_candidates_from_lancedb(
                         path,
                         chunk_text,
                         lexical_score,
+                        modified_unix_secs,
                     },
                 );
             }
@@ -4453,7 +4506,11 @@ fn ai_provider_status_from_config(config: Option<&AiProviderConfig>) -> AiProvid
             embedding_model: cfg.embedding_model.clone(),
             chat_base_url: cfg.chat_base_url.clone(),
             chat_model: cfg.chat_model.clone(),
-            api_key_hint: Some(mask_api_key(&cfg.api_key)),
+            api_key_hint: if cfg.api_key.trim().is_empty() {
+                None
+            } else {
+                Some(mask_api_key(&cfg.api_key))
+            },
         };
     }
 
@@ -4786,6 +4843,18 @@ fn runtime_pressure_snapshot() -> RuntimePressureSnapshot {
     }
 }
 
+fn runtime_cpu_usage_pct() -> f32 {
+    let mut system = System::new_all();
+    system.refresh_cpu();
+    let cpus = system.cpus();
+    if cpus.is_empty() {
+        return 0.0;
+    }
+
+    let total = cpus.iter().map(|cpu| cpu.cpu_usage()).sum::<f32>();
+    (total / cpus.len() as f32).clamp(0.0, 100.0)
+}
+
 fn runtime_pressure_level(memory_pressure_pct: f32) -> &'static str {
     if memory_pressure_pct >= 88.0 {
         "high"
@@ -4910,6 +4979,22 @@ fn default_chat_model_value() -> String {
     "gpt-4o-mini".to_string()
 }
 
+fn default_ollama_embeddings_url_value() -> String {
+    "http://127.0.0.1:11434/api/embed".to_string()
+}
+
+fn default_ollama_chat_url_value() -> String {
+    "http://127.0.0.1:11434/api/chat".to_string()
+}
+
+fn default_ollama_model_value() -> String {
+    "nomic-embed-text".to_string()
+}
+
+fn default_ollama_chat_model_value() -> String {
+    "llama3.2".to_string()
+}
+
 fn mask_api_key(value: &str) -> String {
     let chars = value.chars().collect::<Vec<_>>();
     if chars.len() <= 8 {
@@ -4960,6 +5045,31 @@ async fn request_embeddings(state: &AppState, config: &AiProviderConfig, input: 
         .iter()
         .map(|(_, _, text)| text.clone())
         .collect::<Vec<_>>();
+
+    if config.provider == "ollama-local" {
+        let embeddings = request_ollama_embeddings(config, &missing_input).await?;
+        if embeddings.len() != misses.len() {
+            return Err("Ollama devolvió una cantidad inesperada de embeddings".to_string());
+        }
+
+        if let Ok(mut cache) = state.text_embedding_cache.lock() {
+            for ((index, key, _), embedding) in misses.into_iter().zip(embeddings.into_iter()) {
+                bounded_cache_insert(
+                    &mut cache,
+                    key,
+                    embedding.clone(),
+                    TEXT_EMBEDDING_CACHE_MAX_ITEMS,
+                );
+                output[index] = embedding;
+            }
+        } else {
+            for ((index, _, _), embedding) in misses.into_iter().zip(embeddings.into_iter()) {
+                output[index] = embedding;
+            }
+        }
+
+        return Ok(output);
+    }
 
     let payload = serde_json::json!({
         "model": config.embedding_model,
@@ -5057,6 +5167,10 @@ async fn request_embeddings(state: &AppState, config: &AiProviderConfig, input: 
 }
 
 async fn request_chat_answer(config: &AiProviderConfig, query: &str, context: &str) -> Result<String, String> {
+    if config.provider == "ollama-local" {
+        return request_chat_answer_ollama(config, query, context).await;
+    }
+
     let payload = serde_json::json!({
         "model": config.chat_model,
         "messages": [
@@ -5157,6 +5271,149 @@ fn extract_chat_content(value: &serde_json::Value) -> Result<String, String> {
     }
 
     Err("Contenido de chat no soportado".to_string())
+}
+
+async fn request_ollama_embeddings(config: &AiProviderConfig, input: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    let payload = serde_json::json!({
+        "model": config.embedding_model,
+        "input": input,
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&config.base_url)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("No se pudo llamar embeddings local (Ollama): {}", sanitize_remote_error(&err.to_string())))?;
+
+    let status = response.status();
+    let raw = response
+        .text()
+        .await
+        .map_err(|err| format!("No se pudo leer respuesta Ollama: {}", sanitize_remote_error(&err.to_string())))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "Ollama embeddings respondió {}: {}",
+            status.as_u16(),
+            sanitize_remote_error(&raw).chars().take(220).collect::<String>()
+        ));
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("Respuesta Ollama embeddings inválida: {}", sanitize_remote_error(&err.to_string())))?;
+
+    if let Some(values) = value.get("embeddings").and_then(|item| item.as_array()) {
+        let mut parsed = Vec::with_capacity(values.len());
+        for item in values {
+            let Some(row) = item.as_array() else {
+                continue;
+            };
+            let mut vector = Vec::with_capacity(row.len());
+            for value in row {
+                if let Some(f) = value.as_f64() {
+                    vector.push(f as f32);
+                }
+            }
+            if !vector.is_empty() {
+                parsed.push(vector);
+            }
+        }
+        return Ok(parsed);
+    }
+
+    if let Some(single) = value.get("embedding").and_then(|item| item.as_array()) {
+        let mut vector = Vec::with_capacity(single.len());
+        for value in single {
+            if let Some(f) = value.as_f64() {
+                vector.push(f as f32);
+            }
+        }
+        if !vector.is_empty() {
+            return Ok(vec![vector]);
+        }
+    }
+
+    Err("Respuesta Ollama embeddings sin campos esperados (`embeddings` o `embedding`)".to_string())
+}
+
+async fn request_chat_answer_ollama(config: &AiProviderConfig, query: &str, context: &str) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "model": config.chat_model,
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Responde solo con base en el contexto proporcionado. Si falta evidencia, dilo explícitamente. Sé breve y preciso. Incluye referencias inline tipo [S1], [S2] cuando uses evidencia."
+            },
+            {
+                "role": "user",
+                "content": format!("Consulta: {}\n\nContexto:\n{}", query, context)
+            }
+        ]
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&config.chat_base_url)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("No se pudo llamar chat local (Ollama): {}", sanitize_remote_error(&err.to_string())))?;
+
+    let status = response.status();
+    let raw = response
+        .text()
+        .await
+        .map_err(|err| format!("No se pudo leer respuesta chat local: {}", sanitize_remote_error(&err.to_string())))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "Ollama chat respondió {}: {}",
+            status.as_u16(),
+            sanitize_remote_error(&raw).chars().take(220).collect::<String>()
+        ));
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("Respuesta Ollama chat inválida: {}", sanitize_remote_error(&err.to_string())))?;
+
+    if let Some(text) = value
+        .get("message")
+        .and_then(|msg| msg.get("content"))
+        .and_then(|content| content.as_str())
+    {
+        return Ok(text.to_string());
+    }
+
+    if let Some(text) = value.get("response").and_then(|resp| resp.as_str()) {
+        return Ok(text.to_string());
+    }
+
+    Err("Respuesta Ollama chat sin contenido esperado".to_string())
+}
+
+fn compute_recency_signal(modified_unix_secs: u64) -> f32 {
+    if modified_unix_secs == 0 {
+        return 0.0;
+    }
+
+    let now = now_timestamp_string().parse::<u64>().unwrap_or(modified_unix_secs);
+    let age_secs = now.saturating_sub(modified_unix_secs);
+    let day = 86_400u64;
+
+    if age_secs <= day {
+        1.0
+    } else if age_secs <= day * 7 {
+        0.65
+    } else if age_secs <= day * 30 {
+        0.35
+    } else {
+        0.12
+    }
 }
 
 fn chat_history_path(app: &tauri::AppHandle) -> Option<PathBuf> {
