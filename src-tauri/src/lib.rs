@@ -25,6 +25,11 @@ use tract_onnx::prelude::*;
 use sysinfo::System;
 use tokenizers::Tokenizer;
 
+const TEXT_EMBEDDING_CACHE_MAX_ITEMS: usize = 3500;
+const CLIP_IMAGE_CACHE_MAX_ITEMS: usize = 2200;
+const CLOUD_RETRY_ATTEMPTS: usize = 3;
+const SEMANTIC_SCHEMA_VERSION: i64 = 2;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -229,6 +234,13 @@ struct AppliedPerformanceProfile {
 #[derive(Serialize)]
 struct ClipImageCacheStatus {
     items: usize,
+}
+
+#[derive(Serialize)]
+struct SemanticSchemaInfo {
+    schema_version: i64,
+    chunk_count: u64,
+    db_path: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -785,6 +797,33 @@ fn get_performance_telemetry(state: State<'_, AppState>) -> PerformanceTelemetry
         adaptive_enabled,
         throttling_factor: compute_runtime_throttling_factor(snapshot.memory_pressure_pct),
     }
+}
+
+#[tauri::command]
+fn get_semantic_schema_info(app: tauri::AppHandle) -> Result<SemanticSchemaInfo, String> {
+    let conn = open_semantic_connection(&app)?;
+    let schema_version = conn
+        .query_row(
+            "SELECT value_int FROM metadata WHERE key = 'schema_version' LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(SEMANTIC_SCHEMA_VERSION);
+
+    let chunk_count = conn
+        .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0)
+        .max(0) as u64;
+
+    let db_path = semantic_db_path(&app)
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    Ok(SemanticSchemaInfo {
+        schema_version,
+        chunk_count,
+        db_path,
+    })
 }
 
 #[tauri::command]
@@ -1420,15 +1459,6 @@ fn clip_text_to_image_search(
         }
     }
 
-    let config = config.ok_or_else(|| {
-        "CLIP/ONNX no está configurado. Puedes usar modelos embebidos en resources/models/clip o clip models".to_string()
-    })?;
-
-    let query_embedding = run_clip_text_embedding(&config, clean_query)?;
-    if query_embedding.is_empty() {
-        return Err("No se pudo obtener embedding de texto CLIP".to_string());
-    }
-
     let search_roots = resolve_roots(roots);
     let exclusions = normalize_extensions(excluded_extensions);
     let folder_exclusions = normalize_folder_rules(excluded_folders);
@@ -1454,8 +1484,49 @@ fn clip_text_to_image_search(
         .unwrap_or_default();
 
     if snapshot_items.is_empty() {
-        return Err("No hay índice local para buscar imágenes con CLIP".to_string());
+        return Err("No hay índice local para buscar imágenes".to_string());
     }
+
+    let Some(config) = config else {
+        let fallback = fallback_image_search(
+            &snapshot_items,
+            clean_query,
+            &search_roots,
+            &exclusions,
+            &folder_exclusions,
+            max_file_size_bytes,
+            max_results,
+            "CLIP no configurado",
+        );
+        append_audit_log(
+            state.inner(),
+            "search.clip_onnx.fallback",
+            format!("reason=no-config results={}", fallback.len()),
+        );
+        return Ok(fallback);
+    };
+
+    let query_embedding = match run_clip_text_embedding(&config, clean_query) {
+        Ok(value) if !value.is_empty() => value,
+        _ => {
+            let fallback = fallback_image_search(
+                &snapshot_items,
+                clean_query,
+                &search_roots,
+                &exclusions,
+                &folder_exclusions,
+                max_file_size_bytes,
+                max_results,
+                "inferencia CLIP texto falló",
+            );
+            append_audit_log(
+                state.inner(),
+                "search.clip_onnx.fallback",
+                format!("reason=text-embed-fail results={}", fallback.len()),
+            );
+            return Ok(fallback);
+        }
+    };
 
     let mut scored = Vec::<(f32, IndexedFileItem)>::new();
     let mut inspected = 0usize;
@@ -1516,6 +1587,66 @@ fn clip_text_to_image_search(
     );
 
     Ok(results)
+}
+
+fn fallback_image_search(
+    items: &[IndexedFileItem],
+    clean_query: &str,
+    search_roots: &[PathBuf],
+    exclusions: &[String],
+    folder_exclusions: &[String],
+    max_file_size_bytes: u64,
+    max_results: usize,
+    reason: &str,
+) -> Vec<SearchResultItem> {
+    let tokens = tokenize_query(clean_query);
+    let mut scored = Vec::<(f32, &IndexedFileItem)>::new();
+
+    for item in items {
+        let path_buf = PathBuf::from(&item.path);
+        if !is_image_path(&path_buf) {
+            continue;
+        }
+
+        if !matches_roots(&path_buf, search_roots)
+            || should_skip_custom_dir(&path_buf, folder_exclusions)
+            || is_excluded_file(&path_buf, exclusions)
+            || item.size_bytes > max_file_size_bytes
+        {
+            continue;
+        }
+
+        let lowered = format!("{} {}", item.title.to_lowercase(), item.path.to_lowercase());
+        let token_hits = tokens
+            .iter()
+            .filter(|token| lowered.contains(token.as_str()))
+            .count() as f32;
+        let base = if clean_query.is_empty() { 0.1 } else { token_hits / (tokens.len().max(1) as f32) };
+        if base > 0.0 {
+            scored.push((base, item));
+        }
+    }
+
+    scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+
+    scored
+        .into_iter()
+        .take(max_results)
+        .map(|(score, item)| SearchResultItem {
+            title: item.title.clone(),
+            path: item.path.clone(),
+            snippet: format!(
+                "Fallback imagen {:.2} · {}",
+                score,
+                reason
+            ),
+            match_reason: format!(
+                "Coincidencia léxica en nombre/ruta de imagen (score {:.2})",
+                score
+            ),
+            origin: "local-image-lexical-fallback".to_string(),
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -3613,6 +3744,13 @@ fn open_semantic_connection(app: &tauri::AppHandle) -> Result<Connection, String
 fn ensure_semantic_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
+                CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value_text TEXT,
+                    value_int INTEGER,
+                    updated_unix_secs INTEGER NOT NULL
+                );
+
         CREATE TABLE IF NOT EXISTS chunks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           path TEXT NOT NULL,
@@ -3630,7 +3768,18 @@ fn ensure_semantic_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
         ",
     )
-    .map_err(|err| format!("No se pudo preparar schema de chunks: {err}"))
+    .map_err(|err| format!("No se pudo preparar schema de chunks: {err}"))?;
+
+    let now_unix = now_timestamp_string().parse::<u64>().unwrap_or_default() as i64;
+    conn.execute(
+        "INSERT INTO metadata (key, value_int, updated_unix_secs)
+         VALUES ('schema_version', ?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value_int = excluded.value_int, updated_unix_secs = excluded.updated_unix_secs",
+        params![SEMANTIC_SCHEMA_VERSION, now_unix],
+    )
+    .map_err(|err| format!("No se pudo persistir schema version: {err}"))?;
+
+    Ok(())
 }
 
 fn rebuild_chunk_db(app: &tauri::AppHandle, items: &[IndexedFileItem]) -> Result<(), String> {
@@ -4174,7 +4323,12 @@ fn load_or_compute_clip_image_embedding(
     let embedding = run_clip_image_embedding(config, path)?;
 
     if let Ok(mut cache) = state.clip_image_cache.lock() {
-        cache.insert(path.to_string(), embedding.clone());
+        bounded_cache_insert(
+            &mut cache,
+            path.to_string(),
+            embedding.clone(),
+            CLIP_IMAGE_CACHE_MAX_ITEMS,
+        );
     }
 
     Ok(embedding)
@@ -4626,29 +4780,57 @@ async fn request_embeddings(state: &AppState, config: &AiProviderConfig, input: 
     });
 
     let client = reqwest::Client::new();
-    let response = client
-        .post(&config.base_url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|err| format!("No se pudo llamar API de embeddings: {err}"))?;
+    let mut parsed: Option<EmbeddingResponse> = None;
+    let mut last_error = String::new();
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "Embeddings respondieron {}: {}",
-            status.as_u16(),
-            body.chars().take(220).collect::<String>()
-        ));
+    for attempt in 0..CLOUD_RETRY_ATTEMPTS {
+        let response = client
+            .post(&config.base_url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let value = resp
+                        .json::<EmbeddingResponse>()
+                        .await
+                        .map_err(|err| format!("Respuesta de embeddings inválida: {err}"))?;
+                    parsed = Some(value);
+                    break;
+                }
+
+                let body = resp.text().await.unwrap_or_default();
+                last_error = format!(
+                    "Embeddings respondieron {}: {}",
+                    status.as_u16(),
+                    body.chars().take(220).collect::<String>()
+                );
+
+                if !is_retryable_http_status(status.as_u16()) || attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
+                    return Err(last_error);
+                }
+            }
+            Err(err) => {
+                last_error = format!("No se pudo llamar API de embeddings: {err}");
+                if attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
+                    return Err(last_error);
+                }
+            }
+        }
     }
 
-    let parsed = response
-        .json::<EmbeddingResponse>()
-        .await
-        .map_err(|err| format!("Respuesta de embeddings inválida: {err}"))?;
+    let parsed = parsed.ok_or_else(|| {
+        if last_error.is_empty() {
+            "No se pudo obtener embeddings tras reintentos".to_string()
+        } else {
+            last_error
+        }
+    })?;
 
     let embeddings = parsed
         .data
@@ -4662,7 +4844,12 @@ async fn request_embeddings(state: &AppState, config: &AiProviderConfig, input: 
 
     if let Ok(mut cache) = state.text_embedding_cache.lock() {
         for ((index, key, _), embedding) in misses.into_iter().zip(embeddings.into_iter()) {
-            cache.insert(key, embedding.clone());
+            bounded_cache_insert(
+                &mut cache,
+                key,
+                embedding.clone(),
+                TEXT_EMBEDDING_CACHE_MAX_ITEMS,
+            );
             output[index] = embedding;
         }
     } else {
@@ -4690,29 +4877,57 @@ async fn request_chat_answer(config: &AiProviderConfig, query: &str, context: &s
     });
 
     let client = reqwest::Client::new();
-    let response = client
-        .post(&config.chat_base_url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|err| format!("No se pudo llamar API de chat: {err}"))?;
+    let mut parsed: Option<ChatCompletionResponse> = None;
+    let mut last_error = String::new();
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "Chat respondió {}: {}",
-            status.as_u16(),
-            body.chars().take(220).collect::<String>()
-        ));
+    for attempt in 0..CLOUD_RETRY_ATTEMPTS {
+        let response = client
+            .post(&config.chat_base_url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let value = resp
+                        .json::<ChatCompletionResponse>()
+                        .await
+                        .map_err(|err| format!("Respuesta de chat inválida: {err}"))?;
+                    parsed = Some(value);
+                    break;
+                }
+
+                let body = resp.text().await.unwrap_or_default();
+                last_error = format!(
+                    "Chat respondió {}: {}",
+                    status.as_u16(),
+                    body.chars().take(220).collect::<String>()
+                );
+
+                if !is_retryable_http_status(status.as_u16()) || attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
+                    return Err(last_error);
+                }
+            }
+            Err(err) => {
+                last_error = format!("No se pudo llamar API de chat: {err}");
+                if attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
+                    return Err(last_error);
+                }
+            }
+        }
     }
 
-    let parsed = response
-        .json::<ChatCompletionResponse>()
-        .await
-        .map_err(|err| format!("Respuesta de chat inválida: {err}"))?;
+    let parsed = parsed.ok_or_else(|| {
+        if last_error.is_empty() {
+            "No se pudo obtener respuesta de chat tras reintentos".to_string()
+        } else {
+            last_error
+        }
+    })?;
 
     let Some(choice) = parsed.choices.into_iter().next() else {
         return Err("Chat no devolvió opciones".to_string());
@@ -5076,6 +5291,34 @@ fn sanitize_for_log(input: &str) -> String {
         .collect()
 }
 
+fn is_retryable_http_status(code: u16) -> bool {
+    code == 408 || code == 429 || code >= 500
+}
+
+fn bounded_cache_insert(
+    cache: &mut HashMap<String, Vec<f32>>,
+    key: String,
+    value: Vec<f32>,
+    max_items: usize,
+) {
+    cache.insert(key, value);
+
+    if cache.len() <= max_items {
+        return;
+    }
+
+    let remove_count = cache.len().saturating_sub(max_items);
+    let keys_to_remove = cache
+        .keys()
+        .take(remove_count)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for key in keys_to_remove {
+        cache.remove(&key);
+    }
+}
+
 fn now_timestamp_string() -> String {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => format!("{}", duration.as_secs()),
@@ -5183,6 +5426,7 @@ pub fn run() {
             configure_performance_runtime,
             get_embedding_cache_status,
             clear_embedding_cache,
+            get_semantic_schema_info,
             get_hardware_profile,
             apply_hardware_profile_defaults,
             run_local_semantic_benchmark,

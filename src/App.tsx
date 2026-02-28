@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -207,6 +207,12 @@ type PerformanceTelemetry = {
   throttling_factor: number;
 };
 
+type SemanticSchemaInfo = {
+  schema_version: number;
+  chunk_count: number;
+  db_path: string;
+};
+
 type AuditLogEntry = {
   timestamp: string;
   event: string;
@@ -309,6 +315,8 @@ function App() {
   const [performanceRuntimeStatus, setPerformanceRuntimeStatus] = useState<PerformanceRuntimeStatus | null>(null);
   const [isPerformanceRuntimeSaving, setIsPerformanceRuntimeSaving] = useState(false);
   const [performanceTelemetry, setPerformanceTelemetry] = useState<PerformanceTelemetry | null>(null);
+  const [semanticSchemaInfo, setSemanticSchemaInfo] = useState<SemanticSchemaInfo | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   const refreshStatus = async () => {
     try {
@@ -379,6 +387,13 @@ function App() {
     }
 
     try {
+      const schemaInfo = await invoke<SemanticSchemaInfo>("get_semantic_schema_info");
+      setSemanticSchemaInfo(schemaInfo);
+    } catch {
+      setSemanticSchemaInfo(null);
+    }
+
+    try {
       const clipCache = await invoke<ClipImageCacheStatus>("get_clip_image_cache_status");
       setClipImageCacheStatus(clipCache);
     } catch {
@@ -426,6 +441,30 @@ function App() {
     }, 3500);
 
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTypingTarget =
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.isContentEditable;
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        return;
+      }
+
+      if (!isTypingTarget && event.key === "/") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
   }, []);
 
   const refreshChatHistory = async () => {
@@ -1655,6 +1694,11 @@ function App() {
                 Memoria {performanceTelemetry.memory_available_gb.toFixed(1)}/{performanceTelemetry.memory_total_gb.toFixed(1)} GB libres · presión {performanceTelemetry.memory_pressure_pct.toFixed(1)}% ({performanceTelemetry.pressure_level}) · throttle x{performanceTelemetry.throttling_factor.toFixed(2)}
               </p>
             )}
+            {semanticSchemaInfo && (
+              <p className="mt-1 text-[11px] text-gray-500">
+                Schema semántico v{semanticSchemaInfo.schema_version} · chunks {semanticSchemaInfo.chunk_count}
+              </p>
+            )}
           </div>
         )}
 
@@ -1664,6 +1708,7 @@ function App() {
           </div>
 
           <input
+            ref={searchInputRef}
             type="text"
             className="w-full appearance-none border-0 bg-transparent py-4 text-lg text-white placeholder:text-gray-400 caret-blue-400 outline-none"
             placeholder="Buscar en tu memoria..."
@@ -1703,6 +1748,21 @@ function App() {
                 }
 
                 void runSearch();
+              }
+
+              if (e.key === "Home" && results.length > 0) {
+                e.preventDefault();
+                setSelectedIndex(0);
+                setQuickLookPath(results[0]?.path ?? null);
+                return;
+              }
+
+              if (e.key === "End" && results.length > 0) {
+                e.preventDefault();
+                const last = results.length - 1;
+                setSelectedIndex(last);
+                setQuickLookPath(results[last]?.path ?? null);
+                return;
               }
 
               if (e.key === "Escape") {
