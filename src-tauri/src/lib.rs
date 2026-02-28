@@ -600,6 +600,11 @@ struct FileWatcherStatus {
     pending_events: bool,
     debounce_ms: u64,
     last_event_at: Option<String>,
+    last_event_kind: Option<String>,
+    pending_event_count: u64,
+    total_event_count: u64,
+    last_batch_event_count: u64,
+    last_batch_reason: Option<String>,
     last_reindex_at: Option<String>,
     last_error: Option<String>,
 }
@@ -1339,6 +1344,37 @@ fn stop_file_watcher(state: State<'_, AppState>) -> Result<FileWatcherStatus, St
         status.running = false;
         status.pending_events = false;
     });
+
+    get_existing_watcher_status(state.inner())
+}
+
+#[tauri::command]
+fn clear_file_watcher_error(state: State<'_, AppState>) -> Result<FileWatcherStatus, String> {
+    update_watcher_status(state.inner(), |status| {
+        status.last_error = None;
+    });
+
+    get_existing_watcher_status(state.inner())
+}
+
+#[tauri::command]
+fn trigger_watcher_reindex(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<FileWatcherStatus, String> {
+    let settings = state
+        .index_settings
+        .lock()
+        .map(|value| value.clone())
+        .map_err(|_| "No se pudo leer configuración de indexado".to_string())?;
+
+    execute_indexing(&app, state.inner(), settings, "watcher-manual")?;
+
+    update_watcher_status(state.inner(), |status| {
+        status.last_reindex_at = Some(now_timestamp_string());
+        status.pending_events = false;
+        status.pending_event_count = 0;
+        status.last_batch_reason = Some("manual".to_string());
+    });
+
+    append_audit_log(state.inner(), "watcher.reindex.manual", "trigger manual desde UI".to_string());
 
     get_existing_watcher_status(state.inner())
 }
@@ -2931,6 +2967,9 @@ fn run_file_watcher_loop(
     }
 
     let mut pending_events = false;
+    let mut pending_event_count = 0u64;
+    let mut pending_priority = 1u8;
+    let mut last_event_kind = "modify".to_string();
     let mut last_event_time: Option<Instant> = None;
 
     while !stop_flag.load(Ordering::Relaxed) {
@@ -2940,33 +2979,64 @@ fn run_file_watcher_loop(
                     continue;
                 }
 
+                let (event_kind, priority) = watcher_event_kind_and_priority(&event.kind);
+
                 pending_events = true;
+                pending_event_count = pending_event_count.saturating_add(1);
+                pending_priority = pending_priority.max(priority);
+                last_event_kind = event_kind.clone();
                 last_event_time = Some(Instant::now());
 
                 let app_state = app_handle.state::<AppState>();
                 update_watcher_status(app_state.inner(), |status| {
                     status.pending_events = true;
+                    status.pending_event_count = pending_event_count;
+                    status.total_event_count = status.total_event_count.saturating_add(1);
                     status.last_event_at = Some(now_timestamp_string());
+                    status.last_event_kind = Some(event_kind.clone());
                 });
             }
             Ok(Err(err)) => {
                 let app_state = app_handle.state::<AppState>();
                 update_watcher_status(app_state.inner(), |status| {
-                    status.last_error = Some(format!("Evento watcher inválido: {err}"));
+                    status.last_error = Some(sanitize_for_log(&format!("Evento watcher inválido: {err}")));
                 });
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let effective_debounce_ms = match pending_priority {
+                    3 => debounce_ms.min(450),
+                    2 => debounce_ms.min(700),
+                    _ => debounce_ms,
+                }
+                .max(250);
+
                 if pending_events
                     && last_event_time
-                        .map(|value| value.elapsed() >= Duration::from_millis(debounce_ms))
+                        .map(|value| value.elapsed() >= Duration::from_millis(effective_debounce_ms))
                         .unwrap_or(false)
                 {
+                    let app_state = app_handle.state::<AppState>();
+
+                    if app_state.is_indexing.load(Ordering::Relaxed) {
+                        update_watcher_status(app_state.inner(), |status| {
+                            status.pending_events = true;
+                            status.last_batch_reason = Some("esperando-indexación-en-curso".to_string());
+                        });
+                        continue;
+                    }
+
+                    let batch_count = pending_event_count;
+                    let batch_kind = last_event_kind.clone();
                     pending_events = false;
+                    pending_event_count = 0;
+                    pending_priority = 1;
                     last_event_time = None;
 
-                    let app_state = app_handle.state::<AppState>();
                     update_watcher_status(app_state.inner(), |status| {
                         status.pending_events = false;
+                        status.pending_event_count = 0;
+                        status.last_batch_event_count = batch_count;
+                        status.last_batch_reason = Some(format!("event:{}", batch_kind));
                     });
 
                     let settings = app_state
@@ -2977,7 +3047,11 @@ fn run_file_watcher_loop(
 
                     if let Err(err) = execute_indexing(&app_handle, app_state.inner(), settings, "watcher") {
                         update_watcher_status(app_state.inner(), |status| {
-                            status.last_error = Some(err.clone());
+                            status.last_error = Some(sanitize_for_log(&err));
+                        });
+                    } else {
+                        update_watcher_status(app_state.inner(), |status| {
+                            status.last_reindex_at = Some(now_timestamp_string());
                         });
                     }
                 }
@@ -2998,6 +3072,16 @@ fn is_relevant_watch_event(kind: &EventKind) -> bool {
         kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
     )
+}
+
+fn watcher_event_kind_and_priority(kind: &EventKind) -> (String, u8) {
+    match kind {
+        EventKind::Remove(_) => ("remove".to_string(), 3),
+        EventKind::Create(_) => ("create".to_string(), 2),
+        EventKind::Modify(_) => ("modify".to_string(), 1),
+        EventKind::Any => ("any".to_string(), 1),
+        _ => ("other".to_string(), 1),
+    }
 }
 
 fn search_in_index(
@@ -5590,6 +5674,8 @@ pub fn run() {
             cancel_indexing,
             start_file_watcher,
             stop_file_watcher,
+            clear_file_watcher_error,
+            trigger_watcher_reindex,
             get_file_watcher_status,
             get_runtime_metrics,
             get_performance_telemetry,

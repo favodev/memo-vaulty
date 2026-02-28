@@ -63,6 +63,11 @@ type FileWatcherStatus = {
   pending_events: boolean;
   debounce_ms: number;
   last_event_at: string | null;
+  last_event_kind: string | null;
+  pending_event_count: number;
+  total_event_count: number;
+  last_batch_event_count: number;
+  last_batch_reason: string | null;
   last_reindex_at: string | null;
   last_error: string | null;
 };
@@ -268,6 +273,7 @@ function App() {
   const [isSavingAi, setIsSavingAi] = useState(false);
   const [watcherStatus, setWatcherStatus] = useState<FileWatcherStatus | null>(null);
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
+  const [watcherDebounceMs, setWatcherDebounceMs] = useState("1200");
   const [imagesOnly, setImagesOnly] = useState(false);
   const [isMaintenanceBusy, setIsMaintenanceBusy] = useState(false);
   const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
@@ -347,6 +353,9 @@ function App() {
     try {
       const watcher = await invoke<FileWatcherStatus>("get_file_watcher_status");
       setWatcherStatus(watcher);
+      if (watcher.debounce_ms > 0) {
+        setWatcherDebounceMs(String(watcher.debounce_ms));
+      }
     } catch {
       setWatcherStatus(null);
     }
@@ -1249,16 +1258,19 @@ function App() {
 
       const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
       const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
+      const parsedDebounce = Number.parseInt(watcherDebounceMs, 10);
+      const debounceValue = Number.isFinite(parsedDebounce) ? Math.min(Math.max(parsedDebounce, 300), 30000) : 1200;
 
       const status = await invoke<FileWatcherStatus>("start_file_watcher", {
         roots: searchRoots,
         excludedExtensions: exclusions,
         excludedFolders: excludedFolderRules,
         maxFileSizeMb: maxSizeValue,
-        debounceMs: 1200,
+        debounceMs: debounceValue,
       });
 
       setWatcherStatus(status);
+      setWatcherDebounceMs(String(status.debounce_ms));
       setIndexFeedback({ type: "success", text: "Watcher activo" });
     } catch {
       setIndexFeedback({ type: "error", text: "No se pudo iniciar watcher" });
@@ -1276,6 +1288,35 @@ function App() {
       setIndexFeedback({ type: "success", text: "Watcher detenido" });
     } catch {
       setIndexFeedback({ type: "error", text: "No se pudo detener watcher" });
+    } finally {
+      setIsWatcherLoading(false);
+    }
+  };
+
+  const clearWatcherError = async () => {
+    setIsWatcherLoading(true);
+
+    try {
+      const status = await invoke<FileWatcherStatus>("clear_file_watcher_error");
+      setWatcherStatus(status);
+      setIndexFeedback({ type: "success", text: "Error watcher limpiado" });
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo limpiar error watcher" });
+    } finally {
+      setIsWatcherLoading(false);
+    }
+  };
+
+  const triggerWatcherReindex = async () => {
+    setIsWatcherLoading(true);
+
+    try {
+      const status = await invoke<FileWatcherStatus>("trigger_watcher_reindex");
+      setWatcherStatus(status);
+      setIndexFeedback({ type: "success", text: "Reindex manual por watcher completado" });
+      await refreshStatus();
+    } catch {
+      setIndexFeedback({ type: "error", text: "No se pudo forzar reindex del watcher" });
     } finally {
       setIsWatcherLoading(false);
     }
@@ -1654,7 +1695,13 @@ function App() {
               <div className="mt-2 rounded-md bg-white/5 px-2.5 py-2 ring-1 ring-white/10">
                 <p className="text-[11px] text-gray-300">
                   Watcher: {watcherStatus.running ? "activo" : "detenido"}
-                  {watcherStatus.pending_events ? " · cambios detectados" : ""}
+                  {watcherStatus.pending_events ? ` · cambios detectados (${watcherStatus.pending_event_count})` : ""}
+                </p>
+                <p className="mt-1 text-[11px] text-gray-500">
+                  Debounce: {watcherStatus.debounce_ms} ms · último evento: {watcherStatus.last_event_kind ?? "-"} · total eventos: {watcherStatus.total_event_count}
+                </p>
+                <p className="mt-1 text-[11px] text-gray-500">
+                  Último batch: {watcherStatus.last_batch_event_count} · motivo: {watcherStatus.last_batch_reason ?? "-"}
                 </p>
                 {watcherStatus.last_reindex_at && (
                   <p className="mt-1 text-[11px] text-gray-500">
@@ -1913,11 +1960,58 @@ function App() {
         )}
 
         {!isLoading && errorMessage && (
-          <p className="mt-4 text-sm text-center text-red-400">{errorMessage}</p>
+          <div className="mt-4 rounded-lg bg-red-500/10 px-3 py-2 text-center ring-1 ring-red-400/30">
+            <p className="text-sm text-red-300">{errorMessage}</p>
+            <div className="mt-2 flex items-center justify-center gap-2">
+              <button
+                type="button"
+                className="rounded-md bg-red-500/20 px-2.5 py-1 text-[11px] text-red-200 transition-colors hover:bg-red-500/30"
+                onClick={() => {
+                  void runSearch();
+                }}
+                disabled={isLoading || !query.trim()}
+              >
+                Reintentar búsqueda
+              </button>
+              <button
+                type="button"
+                className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
+                onClick={() => {
+                  setErrorMessage(null);
+                }}
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
         )}
 
         {!isLoading && !errorMessage && hasSearched && results.length === 0 && (
-          <p className="mt-4 text-sm text-center text-gray-500">No se encontraron resultados.</p>
+          <div className="mt-4 rounded-lg bg-white/5 px-3 py-2 text-center ring-1 ring-white/10">
+            <p className="text-sm text-gray-300">No se encontraron resultados.</p>
+            <p className="mt-1 text-[11px] text-gray-500">Prueba menos términos, desactiva “Solo imágenes” o reindexa para incluir cambios recientes.</p>
+            <div className="mt-2 flex items-center justify-center gap-2">
+              <button
+                type="button"
+                className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
+                onClick={() => {
+                  setImagesOnly(false);
+                }}
+              >
+                Quitar filtro imagen
+              </button>
+              <button
+                type="button"
+                className="rounded-md bg-blue-500/30 px-2.5 py-1 text-[11px] text-blue-200 transition-colors hover:bg-blue-500/40"
+                disabled={isIndexing}
+                onClick={() => {
+                  void startIndexing(indexStatus?.roots.length ? indexStatus.roots : searchRoots);
+                }}
+              >
+                Reindexar ahora
+              </button>
+            </div>
+          </div>
         )}
 
         {ragResponse && (
@@ -2319,6 +2413,19 @@ function App() {
                   </p>
 
                   <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <div className="mr-1 flex items-center gap-2 rounded-md bg-black/20 px-2 py-1 ring-1 ring-white/10">
+                      <label className="text-[10px] text-gray-400" htmlFor="watcher-debounce-ms">Debounce ms</label>
+                      <input
+                        id="watcher-debounce-ms"
+                        type="number"
+                        min={300}
+                        max={30000}
+                        className="w-16 border-0 bg-transparent text-[10px] text-gray-200 outline-none"
+                        value={watcherDebounceMs}
+                        onChange={(e) => setWatcherDebounceMs(e.target.value)}
+                      />
+                    </div>
+
                     <button
                       type="button"
                       className="rounded-md bg-blue-500/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-blue-500"
@@ -2339,6 +2446,28 @@ function App() {
                       }}
                     >
                       {isWatcherLoading && watcherStatus?.running ? "Deteniendo..." : "Detener watcher"}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-white/20"
+                      disabled={isWatcherLoading || !watcherStatus?.running}
+                      onClick={() => {
+                        void triggerWatcherReindex();
+                      }}
+                    >
+                      Reindex ahora
+                    </button>
+
+                    <button
+                      type="button"
+                      className="rounded-md bg-amber-500/20 px-3 py-1.5 text-xs text-amber-200 transition-colors hover:bg-amber-500/30"
+                      disabled={isWatcherLoading || !watcherStatus?.last_error}
+                      onClick={() => {
+                        void clearWatcherError();
+                      }}
+                    >
+                      Limpiar error
                     </button>
 
                     <span className="text-[11px] text-gray-400">
