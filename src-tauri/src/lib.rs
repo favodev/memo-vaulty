@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use base64::Engine;
 use std::fs::File;
 use std::fs;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -243,6 +243,13 @@ struct SemanticSchemaInfo {
     db_path: String,
 }
 
+#[derive(Serialize)]
+struct EmbeddingModelIndexStatus {
+    current_embedding_model: String,
+    indexed_embedding_model: String,
+    requires_reindex: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ClipOnnxConfig {
     enabled: bool,
@@ -286,6 +293,8 @@ struct IndexedFileItem {
     size_bytes: u64,
     modified_unix_secs: u64,
     content_excerpt: Option<String>,
+    #[serde(default)]
+    content_hash: Option<String>,
 }
 
 #[tauri::command]
@@ -824,6 +833,58 @@ fn get_semantic_schema_info(app: tauri::AppHandle) -> Result<SemanticSchemaInfo,
         chunk_count,
         db_path,
     })
+}
+
+#[tauri::command]
+fn get_embedding_model_index_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<EmbeddingModelIndexStatus, String> {
+    let current_model = state
+        .ai_config
+        .lock()
+        .ok()
+        .and_then(|cfg| cfg.as_ref().map(|value| value.embedding_model.clone()))
+        .unwrap_or_else(|| "local-lexical".to_string());
+
+    let conn = open_semantic_connection(&app)?;
+    let indexed_model = conn
+        .query_row(
+            "SELECT value_text FROM metadata WHERE key = 'embedding_model' LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    Ok(EmbeddingModelIndexStatus {
+        current_embedding_model: current_model.clone(),
+        indexed_embedding_model: indexed_model.clone(),
+        requires_reindex: indexed_model != current_model,
+    })
+}
+
+#[tauri::command]
+fn sync_embedding_model_index(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    reindex: Option<bool>,
+) -> Result<EmbeddingModelIndexStatus, String> {
+    let should_reindex = reindex.unwrap_or(true);
+    if should_reindex {
+        let settings = state
+            .index_settings
+            .lock()
+            .map_err(|_| "No se pudo leer configuración de indexado".to_string())?
+            .clone();
+
+        if !settings.roots.is_empty() {
+            let _ = execute_indexing(&app, state.inner(), settings, "model-version-sync")?;
+        }
+    } else {
+        persist_embedding_model_version(&app, state.inner())?;
+    }
+
+    get_embedding_model_index_status(app, state)
 }
 
 #[tauri::command]
@@ -2625,6 +2686,8 @@ fn execute_indexing(
             }
         }
 
+        let _ = persist_embedding_model_version(app, state);
+
         save_index_snapshot(app, &snapshot);
 
         {
@@ -3286,10 +3349,12 @@ fn build_index_files(
                 .unwrap_or_default();
 
             let full_path = path.to_string_lossy().to_string();
+            let content_hash = compute_index_content_hash(&path, &extension);
 
             if let Some(previous) = previous_lookup.get(&full_path) {
                 if previous.size_bytes == size_bytes
                     && previous.modified_unix_secs == modified_unix_secs
+                    && previous.content_hash == content_hash
                     && !needs_content_refresh(&path, previous)
                 {
                     if is_pdf {
@@ -3355,6 +3420,7 @@ fn build_index_files(
                 size_bytes,
                 modified_unix_secs,
                 content_excerpt,
+                content_hash,
             });
 
             if scanned_files % 1500 == 0 {
@@ -3425,6 +3491,21 @@ fn needs_content_refresh(path: &Path, previous: &IndexedFileItem) -> bool {
         extension.as_str(),
         "txt" | "md" | "pdf" | "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff"
     )
+}
+
+fn compute_index_content_hash(path: &Path, extension: &str) -> Option<String> {
+    const SAMPLE_BYTES: usize = 24 * 1024;
+
+    let mut file = File::open(path).ok()?;
+    let mut buffer = vec![0_u8; SAMPLE_BYTES];
+    let read_bytes = file.read(&mut buffer).ok()?;
+    buffer.truncate(read_bytes);
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    extension.hash(&mut hasher);
+    buffer.hash(&mut hasher);
+
+    Some(format!("{:016x}", hasher.finish()))
 }
 
 fn extract_indexable_text(path: &Path) -> Option<String> {
@@ -3741,6 +3822,27 @@ fn open_semantic_connection(app: &tauri::AppHandle) -> Result<Connection, String
     Ok(conn)
 }
 
+fn persist_embedding_model_version(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let embedding_model = state
+        .ai_config
+        .lock()
+        .ok()
+        .and_then(|cfg| cfg.as_ref().map(|value| value.embedding_model.clone()))
+        .unwrap_or_else(|| "local-lexical".to_string());
+
+    let conn = open_semantic_connection(app)?;
+    let now_unix = now_timestamp_string().parse::<u64>().unwrap_or_default() as i64;
+    conn.execute(
+        "INSERT INTO metadata (key, value_text, updated_unix_secs)
+         VALUES ('embedding_model', ?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value_text = excluded.value_text, updated_unix_secs = excluded.updated_unix_secs",
+        params![embedding_model, now_unix],
+    )
+    .map_err(|err| format!("No se pudo persistir versión de embedding model: {err}"))?;
+
+    Ok(())
+}
+
 fn ensure_semantic_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
@@ -3858,6 +3960,29 @@ fn split_text_chunks(content: &str, chunk_size: usize, overlap: usize) -> Vec<St
     }
 
     chunks
+}
+
+fn compute_lexical_score(search_key: &str, tokens: &[String], lowered_query: &str) -> f32 {
+    if tokens.is_empty() {
+        return 0.0;
+    }
+
+    let mut hits = 0f32;
+    for token in tokens {
+        if search_key.contains(token) {
+            hits += 1.0;
+        }
+    }
+
+    if lowered_query.len() > 2 && search_key.contains(lowered_query) {
+        hits += 0.75;
+    }
+
+    if hits <= 0.0 {
+        return 0.0;
+    }
+
+    (hits / tokens.len() as f32).min(1.6)
 }
 
 fn search_in_chunk_db(
@@ -3982,22 +4107,11 @@ fn load_chunk_candidates(
             continue;
         }
 
-        let mut hits = 0f32;
-        for token in &tokens {
-            if search_key.contains(token) {
-                hits += 1.0;
-            }
-        }
-
-        if lowered_query.len() > 2 && search_key.contains(&lowered_query) {
-            hits += 0.75;
-        }
-
-        if hits <= 0.0 {
+        let lexical_score = compute_lexical_score(&search_key, &tokens, &lowered_query);
+        if lexical_score <= 0.0 {
             continue;
         }
 
-        let lexical_score = (hits / tokens.len() as f32).min(1.6);
         let current = by_path.get(&path).map(|value| value.lexical_score).unwrap_or(-1.0);
 
         if lexical_score > current {
@@ -4127,22 +4241,11 @@ async fn load_chunk_candidates_from_lancedb(
                 continue;
             }
 
-            let mut hits = 0f32;
-            for token in &tokens {
-                if search_key.contains(token) {
-                    hits += 1.0;
-                }
-            }
-
-            if lowered_query.len() > 2 && search_key.contains(&lowered_query) {
-                hits += 0.75;
-            }
-
-            if hits <= 0.0 {
+            let lexical_score = compute_lexical_score(&search_key, &tokens, &lowered_query);
+            if lexical_score <= 0.0 {
                 continue;
             }
 
-            let lexical_score = (hits / tokens.len() as f32).min(1.6);
             let current = by_path.get(&path).map(|value| value.lexical_score).unwrap_or(-1.0);
 
             if lexical_score > current {
@@ -4799,7 +4902,12 @@ async fn request_embeddings(state: &AppState, config: &AiProviderConfig, input: 
                     let value = resp
                         .json::<EmbeddingResponse>()
                         .await
-                        .map_err(|err| format!("Respuesta de embeddings inválida: {err}"))?;
+                        .map_err(|err| {
+                            format!(
+                                "Respuesta de embeddings inválida: {}",
+                                sanitize_remote_error(&err.to_string())
+                            )
+                        })?;
                     parsed = Some(value);
                     break;
                 }
@@ -4808,7 +4916,7 @@ async fn request_embeddings(state: &AppState, config: &AiProviderConfig, input: 
                 last_error = format!(
                     "Embeddings respondieron {}: {}",
                     status.as_u16(),
-                    body.chars().take(220).collect::<String>()
+                    sanitize_remote_error(&body).chars().take(220).collect::<String>()
                 );
 
                 if !is_retryable_http_status(status.as_u16()) || attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
@@ -4816,7 +4924,10 @@ async fn request_embeddings(state: &AppState, config: &AiProviderConfig, input: 
                 }
             }
             Err(err) => {
-                last_error = format!("No se pudo llamar API de embeddings: {err}");
+                last_error = format!(
+                    "No se pudo llamar API de embeddings: {}",
+                    sanitize_remote_error(&err.to_string())
+                );
                 if attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
                     return Err(last_error);
                 }
@@ -4896,7 +5007,12 @@ async fn request_chat_answer(config: &AiProviderConfig, query: &str, context: &s
                     let value = resp
                         .json::<ChatCompletionResponse>()
                         .await
-                        .map_err(|err| format!("Respuesta de chat inválida: {err}"))?;
+                        .map_err(|err| {
+                            format!(
+                                "Respuesta de chat inválida: {}",
+                                sanitize_remote_error(&err.to_string())
+                            )
+                        })?;
                     parsed = Some(value);
                     break;
                 }
@@ -4905,7 +5021,7 @@ async fn request_chat_answer(config: &AiProviderConfig, query: &str, context: &s
                 last_error = format!(
                     "Chat respondió {}: {}",
                     status.as_u16(),
-                    body.chars().take(220).collect::<String>()
+                    sanitize_remote_error(&body).chars().take(220).collect::<String>()
                 );
 
                 if !is_retryable_http_status(status.as_u16()) || attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
@@ -4913,7 +5029,10 @@ async fn request_chat_answer(config: &AiProviderConfig, query: &str, context: &s
                 }
             }
             Err(err) => {
-                last_error = format!("No se pudo llamar API de chat: {err}");
+                last_error = format!(
+                    "No se pudo llamar API de chat: {}",
+                    sanitize_remote_error(&err.to_string())
+                );
                 if attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
                     return Err(last_error);
                 }
@@ -5283,12 +5402,30 @@ fn append_audit_log(state: &AppState, event: &str, detail: String) {
 
 fn sanitize_for_log(input: &str) -> String {
     let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
-    compact
-        .replace("Bearer ", "Bearer ****")
-        .replace("sk-", "sk-****")
-        .chars()
-        .take(420)
-        .collect()
+    let mut mask_next_bearer_value = false;
+    let mut parts = Vec::new();
+
+    for raw in compact.split(' ') {
+        let mut token = raw.to_string();
+
+        if mask_next_bearer_value {
+            token = "****".to_string();
+            mask_next_bearer_value = false;
+        } else if token.eq_ignore_ascii_case("bearer") {
+            token = "Bearer".to_string();
+            mask_next_bearer_value = true;
+        } else if token.starts_with("sk-") {
+            token = "sk-****".to_string();
+        }
+
+        parts.push(token);
+    }
+
+    parts.join(" ").chars().take(420).collect()
+}
+
+fn sanitize_remote_error(input: &str) -> String {
+    sanitize_for_log(input)
 }
 
 fn is_retryable_http_status(code: u16) -> bool {
@@ -5361,6 +5498,40 @@ fn load_index_snapshot(app: &tauri::AppHandle) -> Option<IndexSnapshot> {
     serde_json::from_str::<IndexSnapshot>(&content).ok()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_text_chunks_applies_overlap() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let chunks = split_text_chunks(text, 10, 2);
+
+        assert!(chunks.len() >= 3);
+        assert_eq!(chunks[0], "abcdefghij");
+        assert!(chunks[1].starts_with("ij"));
+    }
+
+    #[test]
+    fn lexical_score_boosts_full_query_match() {
+        let tokens = vec!["memo".to_string(), "vaulty".to_string()];
+        let lowered_query = "memo vaulty".to_string();
+        let score = compute_lexical_score("memo vaulty app local", &tokens, &lowered_query);
+
+        assert!(score > 1.0);
+        assert!(score <= 1.6);
+    }
+
+    #[test]
+    fn sanitize_remote_error_masks_secrets() {
+        let sanitized = sanitize_remote_error("Authorization: Bearer sk-abc123456789 xyz");
+
+        assert!(!sanitized.contains("abc123456789"));
+        assert!(!sanitized.contains("Bearer sk-"));
+        assert!(sanitized.contains("Bearer ****"));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -5427,6 +5598,8 @@ pub fn run() {
             get_embedding_cache_status,
             clear_embedding_cache,
             get_semantic_schema_info,
+            get_embedding_model_index_status,
+            sync_embedding_model_index,
             get_hardware_profile,
             apply_hardware_profile_defaults,
             run_local_semantic_benchmark,
