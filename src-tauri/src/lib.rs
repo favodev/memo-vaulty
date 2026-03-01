@@ -5879,6 +5879,7 @@ pub fn run() {
         .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             if let Some(snapshot) = load_index_snapshot(app.handle()) {
                 let snapshot_roots = snapshot.roots.clone();

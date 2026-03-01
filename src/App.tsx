@@ -2,6 +2,8 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isRegistered, register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
@@ -490,6 +492,42 @@ function App() {
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  useEffect(() => {
+    const shortcut = "CommandOrControl+Shift+Space";
+
+    const toggleWindowVisibility = async () => {
+      const window = getCurrentWindow();
+      const visible = await window.isVisible();
+
+      if (visible) {
+        await window.hide();
+        return;
+      }
+
+      await window.show();
+      await window.setFocus();
+      searchInputRef.current?.focus();
+    };
+
+    void (async () => {
+      try {
+        const alreadyRegistered = await isRegistered(shortcut);
+        if (!alreadyRegistered) {
+          await register(shortcut, (event) => {
+            if (event.state === "Pressed") {
+              void toggleWindowVisibility();
+            }
+          });
+        }
+      } catch {
+      }
+    })();
+
+    return () => {
+      void unregister(shortcut).catch(() => undefined);
+    };
   }, []);
 
   const refreshChatHistory = async () => {

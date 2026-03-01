@@ -1,7 +1,18 @@
-# Tauri + React + Typescript
+# MEMOVAULT
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+MemoVault es una app de búsqueda inteligente local-first para encontrar información en tus archivos de forma rápida, con enfoque en privacidad y experiencia minimalista.
 
-## Recommended IDE Setup
+## Qué hace la app
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- Busca por contenido y por nombre dentro de tus documentos.
+- Permite indexar carpetas locales y mantener el índice actualizado.
+- Muestra resultados con contexto y acciones rápidas.
+- Incluye vista previa rápida de archivos sin salir de la app.
+- Ofrece modo de búsqueda semántica con proveedor local o cloud.
+- Integra chat con tus propios datos con citas de fuentes.
+
+## Enfoque del producto
+
+- Local-first y control de datos por parte del usuario.
+- Interfaz simple, directa y centrada en productividad.
+- Base multiplataforma con frontend React y backend Tauri/Rust.
