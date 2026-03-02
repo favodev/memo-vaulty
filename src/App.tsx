@@ -97,12 +97,31 @@ type FileVisualPreview = {
   reason: string | null;
 };
 
-type ScanTypeKey = "image" | "text" | "document";
+type ScanTypeKey = "image" | "text";
 
 const FILE_TYPE_GROUPS: Record<ScanTypeKey, string[]> = {
   image: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "svg", "heic", "heif"],
-  text: ["txt", "md", "markdown", "csv", "log", "json", "yaml", "yml", "toml", "ini"],
-  document: ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf", "odt"],
+  text: [
+    "txt",
+    "md",
+    "markdown",
+    "csv",
+    "log",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
+    "rtf",
+    "odt",
+  ],
 };
 
 type RagSourceItem = {
@@ -118,32 +137,6 @@ type RagAnswerResponse = {
   grounded: boolean;
   mode: string;
   sources: RagSourceItem[];
-};
-
-type ChatHistoryItem = {
-  id: string;
-  timestamp: string;
-  query: string;
-  answer: string;
-  grounded: boolean;
-  mode: string;
-  sources: RagSourceItem[];
-};
-
-type RuntimeMetrics = {
-  semantic_calls: number;
-  semantic_avg_ms: number;
-  rag_calls: number;
-  rag_avg_ms: number;
-  indexing_runs: number;
-  indexing_avg_ms: number;
-  last_index_ms: number;
-  embedding_cache_hits: number;
-  embedding_cache_misses: number;
-  embedding_cache_hit_rate: number;
-  embedding_cache_items: number;
-  last_semantic_ms: number;
-  last_rag_ms: number;
 };
 
 type EmbeddingCacheStatus = {
@@ -210,25 +203,6 @@ type PerformanceRuntimeStatus = {
   last_rag_top_k: number;
 };
 
-type PerformanceTelemetry = {
-  memory_total_gb: number;
-  memory_available_gb: number;
-  memory_pressure_pct: number;
-  cpu_usage_pct: number;
-  pressure_level: string;
-  semantic_last_ms: number;
-  rag_last_ms: number;
-  indexing_last_ms: number;
-  adaptive_enabled: boolean;
-  throttling_factor: number;
-};
-
-type SemanticSchemaInfo = {
-  schema_version: number;
-  chunk_count: number;
-  db_path: string;
-};
-
 type AuditLogEntry = {
   timestamp: string;
   event: string;
@@ -275,7 +249,7 @@ function App() {
   const [indexFeedback, setIndexFeedback] = useState<IndexFeedback | null>(null);
   const [indexProgress, setIndexProgress] = useState<IndexProgressEvent | null>(null);
   const [indexDiagnostics, setIndexDiagnostics] = useState<IndexDiagnostics | null>(null);
-  const [aiProviderStatus, setAiProviderStatus] = useState<AiProviderStatus | null>(null);
+  const [, setAiProviderStatus] = useState<AiProviderStatus | null>(null);
   const [aiProviderMode, setAiProviderMode] = useState("openrouter-compatible");
   const [aiApiKey, setAiApiKey] = useState("");
   const [aiModel, setAiModel] = useState("text-embedding-3-small");
@@ -287,11 +261,9 @@ function App() {
   const [isWatcherLoading, setIsWatcherLoading] = useState(false);
   const [watcherDebounceMs, setWatcherDebounceMs] = useState("1200");
   const [scanTypeSelection, setScanTypeSelection] = useState<Record<ScanTypeKey, boolean>>({
-    image: true,
+    image: false,
     text: true,
-    document: true,
   });
-  const [imagesOnly, setImagesOnly] = useState(false);
   const [isMaintenanceBusy, setIsMaintenanceBusy] = useState(false);
   const [quickLookPath, setQuickLookPath] = useState<string | null>(null);
   const [quickLookImageMeta, setQuickLookImageMeta] = useState<ImageMetadata | null>(null);
@@ -303,16 +275,9 @@ function App() {
   const [quickLookVisualUrl, setQuickLookVisualUrl] = useState<string | null>(null);
   const [quickLookVisualReason, setQuickLookVisualReason] = useState<string | null>(null);
   const [isQuickLookVisualLoading, setIsQuickLookVisualLoading] = useState(false);
-  const [searchModeBadge, setSearchModeBadge] = useState<"LOCAL" | "CLOUD" | null>(null);
-  const [isRagLoading, setIsRagLoading] = useState(false);
+  const [, setAnswerMode] = useState<"auto" | "local" | "cloud">("auto");
+  const [, setRagTopK] = useState("4");
   const [ragResponse, setRagResponse] = useState<RagAnswerResponse | null>(null);
-  const [answerMode, setAnswerMode] = useState<"auto" | "local" | "cloud">("auto");
-  const [ragTopK, setRagTopK] = useState("4");
-  const [strictGrounding, setStrictGrounding] = useState(true);
-  const [ragMinScore, setRagMinScore] = useState("0.55");
-  const [chatHistory, setChatHistory] = useState<ChatHistoryItem[]>([]);
-  const [isChatHistoryLoading, setIsChatHistoryLoading] = useState(false);
-  const [runtimeMetrics, setRuntimeMetrics] = useState<RuntimeMetrics | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [isAuditLoading, setIsAuditLoading] = useState(false);
   const [clipStatus, setClipStatus] = useState<ClipOnnxStatus | null>(null);
@@ -322,9 +287,8 @@ function App() {
   const [clipInputSize, setClipInputSize] = useState("224");
   const [clipMaxLength, setClipMaxLength] = useState("77");
   const [isClipSaving, setIsClipSaving] = useState(false);
-  const [isClipSearching, setIsClipSearching] = useState(false);
   const [isClipValidating, setIsClipValidating] = useState(false);
-  const [clipValidation, setClipValidation] = useState<ClipValidationStatus | null>(null);
+  const [, setClipValidation] = useState<ClipValidationStatus | null>(null);
   const [embeddingCacheStatus, setEmbeddingCacheStatus] = useState<EmbeddingCacheStatus | null>(null);
   const [hardwareProfile, setHardwareProfile] = useState<HardwareProfile | null>(null);
   const [benchmarkQuery, setBenchmarkQuery] = useState("nota");
@@ -337,8 +301,6 @@ function App() {
   const [clipImageCacheStatus, setClipImageCacheStatus] = useState<ClipImageCacheStatus | null>(null);
   const [performanceRuntimeStatus, setPerformanceRuntimeStatus] = useState<PerformanceRuntimeStatus | null>(null);
   const [isPerformanceRuntimeSaving, setIsPerformanceRuntimeSaving] = useState(false);
-  const [performanceTelemetry, setPerformanceTelemetry] = useState<PerformanceTelemetry | null>(null);
-  const [semanticSchemaInfo, setSemanticSchemaInfo] = useState<SemanticSchemaInfo | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   const refreshStatus = async () => {
@@ -379,13 +341,6 @@ function App() {
     }
 
     try {
-      const metrics = await invoke<RuntimeMetrics>("get_runtime_metrics");
-      setRuntimeMetrics(metrics);
-    } catch {
-      setRuntimeMetrics(null);
-    }
-
-    try {
       const cacheStatus = await invoke<EmbeddingCacheStatus>("get_embedding_cache_status");
       setEmbeddingCacheStatus(cacheStatus);
     } catch {
@@ -404,20 +359,6 @@ function App() {
       setPerformanceRuntimeStatus(perfRuntime);
     } catch {
       setPerformanceRuntimeStatus(null);
-    }
-
-    try {
-      const telemetry = await invoke<PerformanceTelemetry>("get_performance_telemetry");
-      setPerformanceTelemetry(telemetry);
-    } catch {
-      setPerformanceTelemetry(null);
-    }
-
-    try {
-      const schemaInfo = await invoke<SemanticSchemaInfo>("get_semantic_schema_info");
-      setSemanticSchemaInfo(schemaInfo);
-    } catch {
-      setSemanticSchemaInfo(null);
     }
 
     try {
@@ -456,18 +397,7 @@ function App() {
 
   useEffect(() => {
     void refreshStatus();
-    void refreshChatHistory();
     void refreshAuditLogs();
-  }, []);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      void invoke<PerformanceTelemetry>("get_performance_telemetry")
-        .then((telemetry) => setPerformanceTelemetry(telemetry))
-        .catch(() => undefined);
-    }, 3500);
-
-    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -529,18 +459,6 @@ function App() {
       void unregister(shortcut).catch(() => undefined);
     };
   }, []);
-
-  const refreshChatHistory = async () => {
-    setIsChatHistoryLoading(true);
-    try {
-      const history = await invoke<ChatHistoryItem[]>("get_chat_history", { limit: 12 });
-      setChatHistory(history);
-    } catch {
-      setChatHistory([]);
-    } finally {
-      setIsChatHistoryLoading(false);
-    }
-  };
 
   useEffect(() => {
     if (!watcherStatus?.running) {
@@ -638,10 +556,23 @@ function App() {
     setErrorMessage(null);
 
     try {
+      if (!scanTypeSelection.text && !scanTypeSelection.image) {
+        setResults([]);
+        setSelectedIndex(-1);
+        setQuickLookPath(null);
+        setIndexFeedback({ type: "error", text: "Activa Texto o Imagen para buscar" });
+        return;
+      }
+
       const exclusions = excludedExtensions
         .split(",")
         .map((value) => value.trim())
         .filter((value) => value.length > 0);
+
+      const searchExclusions = new Set(exclusions.map((value) => value.toLowerCase()));
+      if (!scanTypeSelection.image) {
+        FILE_TYPE_GROUPS.image.forEach((ext) => searchExclusions.add(ext));
+      }
 
       const excludedFolderRules = excludedFolders
         .split(",")
@@ -652,27 +583,25 @@ function App() {
       const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
 
       let response: SearchResultItem[] = [];
-      let semanticCommandOk = false;
 
       try {
         response = await invoke<SearchResultItem[]>("semantic_search", {
           query: cleanQuery,
           limit: 30,
           roots: searchRoots,
-          excludedExtensions: exclusions,
+          excludedExtensions: Array.from(searchExclusions),
           excludedFolders: excludedFolderRules,
           maxFileSizeMb: maxSizeValue,
-          imagesOnly,
+          imagesOnly: isImageSearchOnly,
         });
-        semanticCommandOk = true;
       } catch {
         response = await invoke<SearchResultItem[]>("search_stub", {
           query: cleanQuery,
           roots: searchRoots,
-          excludedExtensions: exclusions,
+          excludedExtensions: Array.from(searchExclusions),
           excludedFolders: excludedFolderRules,
           maxFileSizeMb: maxSizeValue,
-          imagesOnly,
+          imagesOnly: isImageSearchOnly,
         });
       }
 
@@ -680,67 +609,13 @@ function App() {
       setSelectedIndex(response.length > 0 ? 0 : -1);
       setQuickLookPath(response.length > 0 ? response[0].path : null);
 
-      const hasCloudSemantic = response.some((item) => item.origin === "cloud-semantic");
-      const isCloud = semanticCommandOk && hasCloudSemantic && Boolean(aiProviderStatus?.configured);
-      setSearchModeBadge(isCloud ? "CLOUD" : "LOCAL");
     } catch {
       setResults([]);
       setSelectedIndex(-1);
       setQuickLookPath(null);
-      setSearchModeBadge(null);
       setErrorMessage("No se pudo ejecutar la búsqueda local.");
     } finally {
       setIsLoading(false);
-      await refreshStatus();
-    }
-  };
-
-  const runLocalAnswer = async () => {
-    const cleanQuery = query.trim();
-    if (!cleanQuery) {
-      setRagResponse(null);
-      return;
-    }
-
-    setIsRagLoading(true);
-    setErrorMessage(null);
-
-    try {
-      const exclusions = excludedExtensions
-        .split(",")
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0);
-
-      const excludedFolderRules = excludedFolders
-        .split(",")
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0);
-
-      const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
-      const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
-      const parsedTopK = Number.parseInt(ragTopK, 10);
-      const topKValue = Number.isFinite(parsedTopK) && parsedTopK > 0 ? Math.min(parsedTopK, 8) : 4;
-      const parsedMinScore = Number.parseFloat(ragMinScore);
-      const minScoreValue = Number.isFinite(parsedMinScore) ? Math.max(0, Math.min(parsedMinScore, 1.6)) : 0.55;
-
-      const response = await invoke<RagAnswerResponse>("answer_with_local_context", {
-        query: cleanQuery,
-        roots: searchRoots,
-        excludedExtensions: exclusions,
-        excludedFolders: excludedFolderRules,
-        maxFileSizeMb: maxSizeValue,
-        topK: topKValue,
-        mode: answerMode,
-        strictGrounding,
-        minScore: minScoreValue,
-      });
-
-      setRagResponse(response);
-      await refreshChatHistory();
-    } catch {
-      setIndexFeedback({ type: "error", text: "No se pudo generar respuesta local" });
-    } finally {
-      setIsRagLoading(false);
       await refreshStatus();
     }
   };
@@ -758,19 +633,6 @@ function App() {
       setIndexFeedback({ type: "error", text: "No se pudo actualizar autoajuste" });
     } finally {
       setIsPerformanceRuntimeSaving(false);
-    }
-  };
-
-  const clearChatHistory = async () => {
-    setIsChatHistoryLoading(true);
-    try {
-      await invoke("clear_chat_history");
-      setChatHistory([]);
-      setIndexFeedback({ type: "success", text: "Historial de chat limpiado" });
-    } catch {
-      setIndexFeedback({ type: "error", text: "No se pudo limpiar historial" });
-    } finally {
-      setIsChatHistoryLoading(false);
     }
   };
 
@@ -833,51 +695,6 @@ function App() {
     }
   };
 
-  const runClipImageSearch = async () => {
-    const cleanQuery = query.trim();
-    if (!cleanQuery) {
-      return;
-    }
-
-    setIsClipSearching(true);
-    setErrorMessage(null);
-
-    try {
-      const exclusions = excludedExtensions
-        .split(",")
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0);
-
-      const excludedFolderRules = excludedFolders
-        .split(",")
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0);
-
-      const parsedMaxSize = Number.parseInt(maxFileSizeMb, 10);
-      const maxSizeValue = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 128;
-
-      const response = await invoke<SearchResultItem[]>("clip_text_to_image_search", {
-        query: cleanQuery,
-        limit: 30,
-        roots: searchRoots,
-        excludedExtensions: exclusions,
-        excludedFolders: excludedFolderRules,
-        maxFileSizeMb: maxSizeValue,
-      });
-
-      setResults(response);
-      setSelectedIndex(response.length > 0 ? 0 : -1);
-      setQuickLookPath(response.length > 0 ? response[0].path : null);
-      setSearchModeBadge("LOCAL");
-      setHasSearched(true);
-      setIndexFeedback({ type: "success", text: `CLIP encontró ${response.length} imágenes` });
-    } catch {
-      setIndexFeedback({ type: "error", text: "Búsqueda CLIP/ONNX falló" });
-    } finally {
-      setIsClipSearching(false);
-    }
-  };
-
   const validateClipSetup = async () => {
     setIsClipValidating(true);
     try {
@@ -935,7 +752,7 @@ function App() {
         excludedExtensions: exclusions,
         excludedFolders: excludedFolderRules,
         maxFileSizeMb: maxSizeValue,
-        imagesOnly,
+        imagesOnly: isImageSearchOnly,
       });
       setBenchmarkResult(result);
       setIndexFeedback({ type: "success", text: `Benchmark OK · avg ${result.avg_ms.toFixed(1)} ms · p95 ${result.p95_ms} ms` });
@@ -998,7 +815,7 @@ function App() {
         excludedExtensions: exclusions,
         excludedFolders: excludedFolderRules,
         maxFileSizeMb: maxSizeValue,
-        imagesOnly,
+        imagesOnly: isImageSearchOnly,
       });
       setColdHotResult(result);
       setIndexFeedback({
@@ -1035,28 +852,6 @@ function App() {
     void validateClipSetup();
   }, [isConfigOpen, clipStatus?.configured, clipStatus?.enabled]);
 
-  const exportChatHistory = async () => {
-    const target = await saveDialog({
-      title: "Exportar historial de chat",
-      defaultPath: "memovault-chat-history.json",
-      filters: [{ name: "JSON", extensions: ["json"] }],
-    });
-
-    if (!target) {
-      return;
-    }
-
-    setIsChatHistoryLoading(true);
-    try {
-      await invoke<string>("export_chat_history_to_file", { path: target, limit: 100 });
-      setIndexFeedback({ type: "success", text: "Historial exportado" });
-    } catch {
-      setIndexFeedback({ type: "error", text: "No se pudo exportar historial" });
-    } finally {
-      setIsChatHistoryLoading(false);
-    }
-  };
-
   const getInvokeErrorMessage = (error: unknown, fallback: string) => {
     if (typeof error === "string" && error.trim()) {
       return error;
@@ -1070,6 +865,7 @@ function App() {
   };
 
   const hasAnyScanTypeSelected = Object.values(scanTypeSelection).some(Boolean);
+  const isImageSearchOnly = !scanTypeSelection.text && scanTypeSelection.image;
 
   const buildExcludedExtensionsFromScanTypes = () => {
     const excluded = new Set<string>();
@@ -1079,9 +875,6 @@ function App() {
     }
     if (!scanTypeSelection.text) {
       FILE_TYPE_GROUPS.text.forEach((ext) => excluded.add(ext));
-    }
-    if (!scanTypeSelection.document) {
-      FILE_TYPE_GROUPS.document.forEach((ext) => excluded.add(ext));
     }
 
     return Array.from(excluded);
@@ -1225,7 +1018,7 @@ function App() {
 
     try {
       if (!hasAnyScanTypeSelected) {
-        setIndexFeedback({ type: "error", text: "Selecciona al menos un tipo: imagen, texto o documento" });
+        setIndexFeedback({ type: "error", text: "Selecciona al menos un tipo: imagen o texto" });
         return;
       }
 
@@ -1335,7 +1128,7 @@ function App() {
 
     try {
       if (!hasAnyScanTypeSelected) {
-        setIndexFeedback({ type: "error", text: "Selecciona al menos un tipo: imagen, texto o documento" });
+        setIndexFeedback({ type: "error", text: "Selecciona al menos un tipo: imagen o texto" });
         return;
       }
 
@@ -1820,29 +1613,6 @@ function App() {
                 </div>
               )}
 
-            {watcherStatus && (
-              <div className="mt-2 rounded-md bg-white/5 px-2.5 py-2 ring-1 ring-white/10">
-                <p className="text-[11px] text-gray-300">
-                  Watcher: {watcherStatus.running ? "activo" : "detenido"}
-                  {watcherStatus.pending_events ? ` · cambios detectados (${watcherStatus.pending_event_count})` : ""}
-                </p>
-                <p className="mt-1 text-[11px] text-gray-500">
-                  Debounce: {watcherStatus.debounce_ms} ms · último evento: {watcherStatus.last_event_kind ?? "-"} · total eventos: {watcherStatus.total_event_count}
-                </p>
-                <p className="mt-1 text-[11px] text-gray-500">
-                  Último batch: {watcherStatus.last_batch_event_count} · motivo: {watcherStatus.last_batch_reason ?? "-"}
-                </p>
-                {watcherStatus.last_reindex_at && (
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    Última auto-indexación: {formatIndexedAt(watcherStatus.last_reindex_at)}
-                  </p>
-                )}
-                {watcherStatus.last_error && (
-                  <p className="mt-1 text-[11px] text-amber-300">{watcherStatus.last_error}</p>
-                )}
-              </div>
-            )}
-
             {formatIndexedAt(indexStatus.indexed_at) && (
               <p className="mt-1 text-[11px] text-gray-500">
                 Última indexación: {formatIndexedAt(indexStatus.indexed_at)}
@@ -1851,32 +1621,36 @@ function App() {
           </div>
         )}
 
-        {runtimeMetrics && (
-          <div className="mb-4 rounded-xl bg-white/4 p-3 ring-1 ring-white/10">
-            <p className="text-xs text-gray-300">
-              Métricas runtime · búsq semántica: <span className="text-white">{runtimeMetrics.semantic_calls}</span> ({runtimeMetrics.semantic_avg_ms.toFixed(1)} ms prom) · RAG: <span className="text-white">{runtimeMetrics.rag_calls}</span> ({runtimeMetrics.rag_avg_ms.toFixed(1)} ms prom)
-            </p>
-            <p className="mt-1 text-[11px] text-gray-500">
-              Indexaciones: {runtimeMetrics.indexing_runs} · promedio {runtimeMetrics.indexing_avg_ms.toFixed(0)} ms · última {runtimeMetrics.last_index_ms} ms
-            </p>
-            <p className="mt-1 text-[11px] text-gray-500">
-              Caché embeddings: {runtimeMetrics.embedding_cache_items} items · hits {runtimeMetrics.embedding_cache_hits} · misses {runtimeMetrics.embedding_cache_misses} · hit rate {runtimeMetrics.embedding_cache_hit_rate.toFixed(1)}%
-            </p>
-            <p className="mt-1 text-[11px] text-gray-500">
-              Últimas latencias · semantic {runtimeMetrics.last_semantic_ms} ms · rag {runtimeMetrics.last_rag_ms} ms
-            </p>
-            {performanceTelemetry && (
-              <p className="mt-1 text-[11px] text-gray-500">
-                Memoria {performanceTelemetry.memory_available_gb.toFixed(1)}/{performanceTelemetry.memory_total_gb.toFixed(1)} GB libres · presión {performanceTelemetry.memory_pressure_pct.toFixed(1)}% ({performanceTelemetry.pressure_level}) · CPU {performanceTelemetry.cpu_usage_pct.toFixed(1)}% · throttle x{performanceTelemetry.throttling_factor.toFixed(2)}
-              </p>
-            )}
-            {semanticSchemaInfo && (
-              <p className="mt-1 text-[11px] text-gray-500">
-                Schema semántico v{semanticSchemaInfo.schema_version} · chunks {semanticSchemaInfo.chunk_count}
-              </p>
-            )}
-          </div>
-        )}
+        <div className="mb-2 flex items-center gap-2">
+          <button
+            type="button"
+            className={`rounded-md px-3 py-1.5 text-xs transition-colors ring-1 ${
+              scanTypeSelection.text
+                ? "bg-emerald-500/20 text-emerald-200 ring-emerald-400/30"
+                : "bg-white/10 text-gray-300 ring-white/15 hover:bg-white/20"
+            }`}
+            onClick={() => {
+              setScanTypeSelection((prev) => ({ ...prev, text: !prev.text }));
+            }}
+          >
+            Texto
+          </button>
+
+          <button
+            type="button"
+            className={`rounded-md px-3 py-1.5 text-xs transition-colors ring-1 ${
+              scanTypeSelection.image
+                ? "bg-emerald-500/20 text-emerald-200 ring-emerald-400/30"
+                : "bg-white/10 text-gray-300 ring-white/15 hover:bg-white/20"
+            }`}
+            onClick={() => {
+              setIndexFeedback({ type: "running", text: "Búsqueda por imagen en proceso" });
+              setScanTypeSelection((prev) => ({ ...prev, image: false }));
+            }}
+          >
+            Imagen
+          </button>
+        </div>
 
         <div className="group flex items-center gap-3 rounded-xl bg-white/5 px-4 transition-all duration-300 focus-within:bg-white/10 ring-1 ring-white/10">
           <div className="text-gray-500 group-focus-within:text-blue-400 transition-colors pointer-events-none shrink-0">
@@ -1956,132 +1730,6 @@ function App() {
             }}
             autoFocus
           />
-
-          <button
-            type="button"
-            className={`shrink-0 rounded-md px-2 py-1 text-[10px] font-medium transition-colors ${
-              imagesOnly
-                ? "bg-fuchsia-500/20 text-fuchsia-300 ring-1 ring-fuchsia-400/30"
-                : "bg-white/10 text-gray-300 hover:bg-white/20"
-            }`}
-            onClick={() => setImagesOnly((value) => !value)}
-            title="Limitar búsqueda a imágenes"
-          >
-            Solo imágenes
-          </button>
-
-          <button
-            type="button"
-            className="shrink-0 rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-gray-300 transition-colors hover:bg-white/20"
-            onClick={() => {
-              void runLocalAnswer();
-            }}
-            disabled={isRagLoading}
-            title="Responder usando tus archivos indexados"
-          >
-            {isRagLoading ? "Respondiendo..." : "Responder"}
-          </button>
-
-          <button
-            type="button"
-            className="shrink-0 rounded-md bg-violet-500/20 px-2 py-1 text-[10px] font-medium text-violet-300 ring-1 ring-violet-400/30 transition-colors hover:bg-violet-500/30"
-            onClick={() => {
-              void runClipImageSearch();
-            }}
-            disabled={isClipSearching}
-            title="Buscar imágenes por semántica CLIP ONNX"
-          >
-            {isClipSearching ? "CLIP..." : "CLIP Img"}
-          </button>
-
-          {clipStatus?.configured && (
-            <span
-              className={`shrink-0 rounded-md px-2 py-1 text-[10px] font-medium ring-1 ${
-                clipValidation?.text_inference_ok && (!clipValidation.sample_image_path || clipValidation.image_inference_ok)
-                  ? "bg-emerald-500/20 text-emerald-300 ring-emerald-400/30"
-                  : "bg-amber-500/20 text-amber-300 ring-amber-400/30"
-              }`}
-              title={clipValidation?.message ?? "Estado CLIP pendiente de verificación"}
-            >
-              {clipValidation?.text_inference_ok && (!clipValidation.sample_image_path || clipValidation.image_inference_ok)
-                ? "CLIP OK"
-                : "CLIP CHECK"}
-            </span>
-          )}
-
-          <div className="flex shrink-0 items-center gap-1">
-            <button
-              type="button"
-              className={`rounded-md px-2 py-1 text-[10px] ${answerMode === "auto" ? "bg-cyan-500/20 text-cyan-300 ring-1 ring-cyan-400/30" : "bg-white/10 text-gray-300 hover:bg-white/20"}`}
-              onClick={() => setAnswerMode("auto")}
-              title="AUTO: intenta cloud y cae a local"
-            >
-              AUTO
-            </button>
-            <button
-              type="button"
-              className={`rounded-md px-2 py-1 text-[10px] ${answerMode === "local" ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30" : "bg-white/10 text-gray-300 hover:bg-white/20"}`}
-              onClick={() => setAnswerMode("local")}
-              title="LOCAL: solo índice local"
-            >
-              LOCAL
-            </button>
-            <button
-              type="button"
-              className={`rounded-md px-2 py-1 text-[10px] ${answerMode === "cloud" ? "bg-indigo-500/20 text-indigo-300 ring-1 ring-indigo-400/30" : "bg-white/10 text-gray-300 hover:bg-white/20"}`}
-              onClick={() => setAnswerMode("cloud")}
-              title="CLOUD: usa proveedor de chat configurado"
-            >
-              CLOUD
-            </button>
-          </div>
-
-          <div className="flex shrink-0 items-center gap-1 rounded-md bg-white/5 px-2 py-1 ring-1 ring-white/10">
-            <span className="text-[10px] text-gray-400">k</span>
-            <input
-              type="number"
-              min={1}
-              max={8}
-              className="w-10 border-0 bg-transparent text-[10px] text-gray-200 outline-none"
-              value={ragTopK}
-              onChange={(e) => setRagTopK(e.target.value)}
-              title="Número de fuentes para responder"
-            />
-          </div>
-
-          <div className="flex shrink-0 items-center gap-1 rounded-md bg-white/5 px-2 py-1 ring-1 ring-white/10">
-            <button
-              type="button"
-              className={`rounded px-1.5 py-0.5 text-[10px] ${strictGrounding ? "bg-amber-500/20 text-amber-300" : "bg-white/10 text-gray-300"}`}
-              onClick={() => setStrictGrounding((value) => !value)}
-              title="Bloquea respuestas cuando la evidencia no alcance el umbral"
-            >
-              Estricto
-            </button>
-            <input
-              type="number"
-              min={0}
-              max={1.6}
-              step={0.05}
-              className="w-12 border-0 bg-transparent text-[10px] text-gray-200 outline-none"
-              value={ragMinScore}
-              onChange={(e) => setRagMinScore(e.target.value)}
-              title="Umbral mínimo de score"
-            />
-          </div>
-
-          {searchModeBadge && (
-            <span
-              className={`mr-1 rounded-md px-2 py-1 text-[10px] font-medium ${
-                searchModeBadge === "CLOUD"
-                  ? "bg-indigo-500/20 text-indigo-300 ring-1 ring-indigo-400/30"
-                  : "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30"
-              }`}
-              title={searchModeBadge === "CLOUD" ? "Resultados con embeddings API" : "Resultados locales"}
-            >
-              {searchModeBadge}
-            </span>
-          )}
         </div>
 
         {isLoading && (
@@ -2118,17 +1766,8 @@ function App() {
         {!isLoading && !errorMessage && hasSearched && results.length === 0 && (
           <div className="mt-4 rounded-lg bg-white/5 px-3 py-2 text-center ring-1 ring-white/10">
             <p className="text-sm text-gray-300">No se encontraron resultados.</p>
-            <p className="mt-1 text-[11px] text-gray-500">Prueba menos términos, desactiva “Solo imágenes” o reindexa para incluir cambios recientes.</p>
+            <p className="mt-1 text-[11px] text-gray-500">Prueba menos términos o reindexa para incluir cambios recientes.</p>
             <div className="mt-2 flex items-center justify-center gap-2">
-              <button
-                type="button"
-                className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] text-gray-200 transition-colors hover:bg-white/20"
-                onClick={() => {
-                  setImagesOnly(false);
-                }}
-              >
-                Quitar filtro imagen
-              </button>
               <button
                 type="button"
                 className="rounded-md bg-blue-500/30 px-2.5 py-1 text-[11px] text-blue-200 transition-colors hover:bg-blue-500/40"
@@ -2210,55 +1849,6 @@ function App() {
             )}
           </div>
         )}
-
-        <div className="mt-4 rounded-xl bg-white/4 p-4 ring-1 ring-white/10">
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-xs font-medium text-white">Historial local de respuestas</p>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                className="rounded-md bg-white/10 px-2 py-1 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
-                onClick={() => {
-                  void exportChatHistory();
-                }}
-                disabled={isChatHistoryLoading}
-              >
-                Exportar
-              </button>
-              <button
-                type="button"
-                className="rounded-md bg-white/10 px-2 py-1 text-[10px] text-gray-200 transition-colors hover:bg-white/20"
-                onClick={() => {
-                  void clearChatHistory();
-                }}
-                disabled={isChatHistoryLoading}
-              >
-                Limpiar historial
-              </button>
-            </div>
-          </div>
-
-          {chatHistory.length === 0 ? (
-            <p className="mt-2 text-[11px] text-gray-500">Sin historial todavía.</p>
-          ) : (
-            <div className="mt-2 space-y-2">
-              {chatHistory.map((entry) => (
-                <div key={entry.id} className="rounded-md bg-white/5 p-2 ring-1 ring-white/10">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="truncate text-[11px] text-white">{entry.query}</p>
-                    <div className="flex items-center gap-1">
-                      <span className="rounded-md bg-white/10 px-1.5 py-0.5 text-[10px] text-gray-300">{entry.mode.toUpperCase()}</span>
-                      <span className={`rounded-md px-1.5 py-0.5 text-[10px] ${entry.grounded ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"}`}>
-                        {entry.grounded ? "OK" : "NO-EV"}
-                      </span>
-                    </div>
-                  </div>
-                  <p className="mt-1 line-clamp-2 text-[11px] text-gray-400">{entry.answer}</p>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
 
         {!isLoading && results.length > 0 && (
           <div className="mt-5 max-h-[62vh] space-y-2 overflow-y-auto pr-1 pb-2">
@@ -2396,39 +1986,47 @@ function App() {
                 </div>
 
                 <div className="rounded-lg bg-white/5 p-3 ring-1 ring-white/10">
-                  <p className="text-xs uppercase tracking-wide text-gray-500">Tipo de archivos</p>
-                  <p className="mt-1 text-[11px] text-gray-500">Selecciona qué categorías quieres escanear.</p>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-xs uppercase tracking-wide text-gray-500">Reindexación automática</p>
+                      <p className="mt-1 text-[11px] text-gray-500">
+                        Vigila cambios en archivos nuevos/modificados y reindexa automáticamente cuando detecta cambios.
+                      </p>
+                      <p className="mt-1 text-[11px] text-gray-400">
+                        Estado actual: {watcherStatus?.running ? "Activada" : "Desactivada"}
+                      </p>
+                    </div>
 
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {(
-                      [
-                        { key: "image", label: "Imagen" },
-                        { key: "text", label: "Texto" },
-                        { key: "document", label: "Documento" },
-                      ] as Array<{ key: ScanTypeKey; label: string }>
-                    ).map((item) => {
-                      const enabled = scanTypeSelection[item.key];
-                      return (
-                        <button
-                          key={item.key}
-                          type="button"
-                          className={`rounded-md px-3 py-1.5 text-xs transition-colors ring-1 ${
-                            enabled
-                              ? "bg-emerald-500/20 text-emerald-200 ring-emerald-400/30"
-                              : "bg-white/5 text-gray-400 ring-white/10 hover:bg-white/10"
-                          }`}
-                          onClick={() => {
-                            setScanTypeSelection((prev) => ({ ...prev, [item.key]: !prev[item.key] }));
-                          }}
-                        >
-                          {item.label}
-                        </button>
-                      );
-                    })}
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={watcherStatus?.running ? "true" : "false"}
+                      className={`relative h-6 w-12 shrink-0 rounded-full transition-colors ring-1 ${
+                        watcherStatus?.running
+                          ? "bg-emerald-500/40 ring-emerald-400/40"
+                          : "bg-white/10 ring-white/20"
+                      }`}
+                      disabled={isWatcherLoading || !hasAnyScanTypeSelected}
+                      onClick={() => {
+                        if (watcherStatus?.running) {
+                          void stopWatcher();
+                        } else {
+                          void startWatcher();
+                        }
+                      }}
+                    >
+                      <span
+                        className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+                          watcherStatus?.running ? "translate-x-6" : "translate-x-0.5"
+                        }`}
+                      />
+                    </button>
                   </div>
 
                   {!hasAnyScanTypeSelected && (
-                    <p className="mt-2 text-[11px] text-amber-300">Selecciona al menos un tipo para poder indexar.</p>
+                    <p className="mt-2 text-[11px] text-amber-300">
+                      Para activar la reindexación automática debes seleccionar al menos un tipo de archivo.
+                    </p>
                   )}
                 </div>
 
