@@ -29,6 +29,7 @@ const TEXT_EMBEDDING_CACHE_MAX_ITEMS: usize = 3500;
 const CLIP_IMAGE_CACHE_MAX_ITEMS: usize = 2200;
 const CLOUD_RETRY_ATTEMPTS: usize = 3;
 const SEMANTIC_SCHEMA_VERSION: i64 = 2;
+const OCR_MAX_IMAGE_BYTES: u64 = 3 * 1024 * 1024;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -3531,7 +3532,7 @@ fn build_index_files(
                     }
                 }
             } else {
-                extract_indexable_text(&path)
+                extract_indexable_text(&path, state)
             };
             let mut search_key = file_name.to_lowercase();
 
@@ -3635,7 +3636,7 @@ fn compute_index_content_hash(path: &Path, extension: &str) -> Option<String> {
     Some(format!("{:016x}", hasher.finish()))
 }
 
-fn extract_indexable_text(path: &Path) -> Option<String> {
+fn extract_indexable_text(path: &Path, state: &AppState) -> Option<String> {
     const MAX_READ_BYTES: usize = 32 * 1024;
 
     let extension = path
@@ -3644,7 +3645,23 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
         .map(|value| value.to_lowercase())?;
 
     if is_image_extension(&extension) {
-        return extract_image_metadata_text(path);
+        let metadata_text = extract_image_metadata_text(path);
+        let ocr_text = extract_image_ocr_text(path, state);
+
+        return match (metadata_text, ocr_text) {
+            (Some(metadata), Some(ocr)) => {
+                let merged = format!("{} {}", metadata, ocr);
+                let normalized = normalize_text_for_index(&merged, 4_600);
+                if normalized.is_empty() {
+                    None
+                } else {
+                    Some(normalized)
+                }
+            }
+            (Some(metadata), None) => Some(metadata),
+            (None, Some(ocr)) => Some(ocr),
+            (None, None) => None,
+        };
     }
 
     if extension != "txt" && extension != "md" {
@@ -3660,6 +3677,49 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
         None
     } else {
         Some(normalized)
+    }
+}
+
+fn extract_image_ocr_text(path: &Path, state: &AppState) -> Option<String> {
+    let ai_config = state
+        .ai_config
+        .lock()
+        .ok()
+        .and_then(|value| value.as_ref().cloned())?;
+
+    if ai_config.provider != "ollama-local" && ai_config.api_key.trim().is_empty() {
+        return None;
+    }
+
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > OCR_MAX_IMAGE_BYTES {
+        return None;
+    }
+
+    let ocr = tauri::async_runtime::block_on(request_image_ocr_text(&ai_config, path)).ok()?;
+    let normalized = normalize_text_for_index(&ocr, 4_000);
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn image_mime_for_path(path: &Path) -> Option<&'static str> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())?;
+
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
+        "tiff" | "tif" => Some("image/tiff"),
+        _ => None,
     }
 }
 
@@ -5394,6 +5454,165 @@ async fn request_chat_answer_ollama(config: &AiProviderConfig, query: &str, cont
     }
 
     Err("Respuesta Ollama chat sin contenido esperado".to_string())
+}
+
+async fn request_image_ocr_text(config: &AiProviderConfig, path: &Path) -> Result<String, String> {
+    if config.provider == "ollama-local" {
+        return request_image_ocr_text_ollama(config, path).await;
+    }
+
+    request_image_ocr_text_cloud(config, path).await
+}
+
+async fn request_image_ocr_text_cloud(config: &AiProviderConfig, path: &Path) -> Result<String, String> {
+    let mime = image_mime_for_path(path).ok_or_else(|| "Formato de imagen no soportado para OCR".to_string())?;
+    let bytes = fs::read(path).map_err(|err| format!("No se pudo leer imagen para OCR: {err}"))?;
+    let data_url = format!(
+        "data:{};base64,{}",
+        mime,
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+
+    let payload = serde_json::json!({
+        "model": config.chat_model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Eres un OCR estricto. Extrae únicamente el texto visible de la imagen en orden de lectura. No inventes contenido ni agregues explicación."
+            },
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Extrae todo el texto legible de esta imagen." },
+                    { "type": "image_url", "image_url": { "url": data_url } }
+                ]
+            }
+        ]
+    });
+
+    let client = reqwest::Client::new();
+    let mut parsed: Option<ChatCompletionResponse> = None;
+    let mut last_error = String::new();
+
+    for attempt in 0..CLOUD_RETRY_ATTEMPTS {
+        let response = client
+            .post(&config.chat_base_url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let value = resp
+                        .json::<ChatCompletionResponse>()
+                        .await
+                        .map_err(|err| format!("Respuesta OCR cloud inválida: {}", sanitize_remote_error(&err.to_string())))?;
+                    parsed = Some(value);
+                    break;
+                }
+
+                let body = resp.text().await.unwrap_or_default();
+                last_error = format!(
+                    "OCR cloud respondió {}: {}",
+                    status.as_u16(),
+                    sanitize_remote_error(&body).chars().take(220).collect::<String>()
+                );
+
+                if !is_retryable_http_status(status.as_u16()) || attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
+                    return Err(last_error);
+                }
+            }
+            Err(err) => {
+                last_error = format!(
+                    "No se pudo llamar OCR cloud: {}",
+                    sanitize_remote_error(&err.to_string())
+                );
+                if attempt + 1 >= CLOUD_RETRY_ATTEMPTS {
+                    return Err(last_error);
+                }
+            }
+        }
+    }
+
+    let parsed = parsed.ok_or_else(|| {
+        if last_error.is_empty() {
+            "No se pudo obtener OCR cloud tras reintentos".to_string()
+        } else {
+            last_error
+        }
+    })?;
+
+    let Some(choice) = parsed.choices.into_iter().next() else {
+        return Err("OCR cloud no devolvió opciones".to_string());
+    };
+
+    extract_chat_content(&choice.message.content)
+}
+
+async fn request_image_ocr_text_ollama(config: &AiProviderConfig, path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|err| format!("No se pudo leer imagen para OCR: {err}"))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    let payload = serde_json::json!({
+        "model": config.chat_model,
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Eres un OCR estricto. Extrae únicamente el texto visible de la imagen en orden de lectura. No inventes contenido ni agregues explicación."
+            },
+            {
+                "role": "user",
+                "content": "Extrae todo el texto legible de esta imagen.",
+                "images": [encoded]
+            }
+        ]
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&config.chat_base_url)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("No se pudo llamar OCR local (Ollama): {}", sanitize_remote_error(&err.to_string())))?;
+
+    let status = response.status();
+    let raw = response
+        .text()
+        .await
+        .map_err(|err| format!("No se pudo leer respuesta OCR local: {}", sanitize_remote_error(&err.to_string())))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "OCR local respondió {}: {}",
+            status.as_u16(),
+            sanitize_remote_error(&raw).chars().take(220).collect::<String>()
+        ));
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("Respuesta OCR local inválida: {}", sanitize_remote_error(&err.to_string())))?;
+
+    if let Some(text) = value
+        .get("message")
+        .and_then(|msg| msg.get("content"))
+        .and_then(|content| content.as_str())
+    {
+        return Ok(text.to_string());
+    }
+
+    if let Some(text) = value.get("response").and_then(|resp| resp.as_str()) {
+        return Ok(text.to_string());
+    }
+
+    Err("Respuesta OCR local sin contenido esperado".to_string())
 }
 
 fn compute_recency_signal(modified_unix_secs: u64) -> f32 {
