@@ -30,6 +30,8 @@ const CLIP_IMAGE_CACHE_MAX_ITEMS: usize = 2200;
 const CLOUD_RETRY_ATTEMPTS: usize = 3;
 const SEMANTIC_SCHEMA_VERSION: i64 = 2;
 const OCR_MAX_IMAGE_BYTES: u64 = 3 * 1024 * 1024;
+const MAX_TEXT_READ_BYTES: usize = 512 * 1024;
+const MAX_DOC_XML_READ_BYTES: u64 = 3 * 1024 * 1024;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -3615,10 +3617,9 @@ fn needs_content_refresh(path: &Path, previous: &IndexedFileItem) -> bool {
         .map(|value| value.to_lowercase())
         .unwrap_or_default();
 
-    matches!(
-        extension.as_str(),
-        "txt" | "md" | "pdf" | "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff"
-    )
+    extension == "pdf"
+        || is_image_extension(&extension)
+        || is_supported_text_extension(&extension)
 }
 
 fn compute_index_content_hash(path: &Path, extension: &str) -> Option<String> {
@@ -3637,8 +3638,6 @@ fn compute_index_content_hash(path: &Path, extension: &str) -> Option<String> {
 }
 
 fn extract_indexable_text(path: &Path, state: &AppState) -> Option<String> {
-    const MAX_READ_BYTES: usize = 32 * 1024;
-
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -3664,19 +3663,347 @@ fn extract_indexable_text(path: &Path, state: &AppState) -> Option<String> {
         };
     }
 
-    if extension != "txt" && extension != "md" {
+    let normalized = match extension.as_str() {
+        "docx" => extract_docx_text(path)
+            .map(|content| normalize_text_for_index(&content, 120_000)),
+        "odt" => extract_odt_text(path)
+            .map(|content| normalize_text_for_index(&content, 120_000)),
+        "rtf" => extract_rtf_text(path)
+            .map(|content| normalize_text_for_index(&content, 120_000)),
+        _ => extract_generic_text(path, &extension)
+            .map(|content| normalize_text_for_index(&content, 120_000)),
+    };
+
+    let normalized = match normalized {
+        Some(value) => value,
+        None => return None,
+    };
+
+    if normalized.is_empty() { None } else { Some(normalized) }
+}
+
+fn is_supported_text_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "txt"
+            | "md"
+            | "markdown"
+            | "rst"
+            | "adoc"
+            | "text"
+            | "log"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "jsonl"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "env"
+            | "properties"
+            | "xml"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "sass"
+            | "less"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "mjs"
+            | "cjs"
+            | "py"
+            | "pyi"
+            | "ipynb"
+            | "java"
+            | "kt"
+            | "kts"
+            | "scala"
+            | "go"
+            | "rs"
+            | "c"
+            | "h"
+            | "cpp"
+            | "cc"
+            | "cxx"
+            | "hpp"
+            | "cs"
+            | "swift"
+            | "m"
+            | "mm"
+            | "php"
+            | "rb"
+            | "pl"
+            | "lua"
+            | "r"
+            | "jl"
+            | "dart"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "ps1"
+            | "psm1"
+            | "cmd"
+            | "bat"
+            | "sql"
+            | "graphql"
+            | "gql"
+            | "vue"
+            | "svelte"
+            | "dockerfile"
+            | "makefile"
+            | "gitignore"
+            | "gitattributes"
+            | "editorconfig"
+            | "lock"
+            | "tex"
+            | "bib"
+            | "srt"
+            | "vtt"
+            | "po"
+            | "docx"
+            | "odt"
+            | "rtf"
+    )
+}
+
+fn extract_generic_text(path: &Path, extension: &str) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let slice = &bytes[..bytes.len().min(MAX_TEXT_READ_BYTES)];
+
+    if !is_supported_text_extension(extension) && !is_probably_text_content(slice) {
         return None;
     }
 
-    let bytes = fs::read(path).ok()?;
-    let slice = &bytes[..bytes.len().min(MAX_READ_BYTES)];
-    let content = String::from_utf8_lossy(slice);
-    let normalized = normalize_text_for_index(&content, 12_000);
-
-    if normalized.is_empty() {
+    let decoded = decode_text_bytes(slice);
+    if decoded.trim().is_empty() {
         None
     } else {
-        Some(normalized)
+        Some(decoded)
+    }
+}
+
+fn is_probably_text_content(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return true;
+    }
+
+    let mut control_count = 0usize;
+    let mut nul_count = 0usize;
+
+    for byte in bytes {
+        if *byte == 0 {
+            nul_count += 1;
+        }
+
+        if (*byte < 0x09) || (*byte > 0x0D && *byte < 0x20) {
+            control_count += 1;
+        }
+    }
+
+    let len = bytes.len().max(1);
+    let control_ratio = (control_count as f32) / (len as f32);
+    let nul_ratio = (nul_count as f32) / (len as f32);
+
+    control_ratio < 0.03 && nul_ratio < 0.01
+}
+
+fn decode_text_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let mut units = Vec::with_capacity(bytes.len() / 2);
+        for chunk in bytes[2..].chunks_exact(2) {
+            units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        return String::from_utf16_lossy(&units);
+    }
+
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let mut units = Vec::with_capacity(bytes.len() / 2);
+        for chunk in bytes[2..].chunks_exact(2) {
+            units.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        return String::from_utf16_lossy(&units);
+    }
+
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+fn extract_docx_text(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut combined = String::new();
+
+    let xml_entries = [
+        "word/document.xml",
+        "word/header1.xml",
+        "word/header2.xml",
+        "word/header3.xml",
+        "word/footer1.xml",
+        "word/footer2.xml",
+        "word/footer3.xml",
+        "word/footnotes.xml",
+        "word/endnotes.xml",
+        "word/comments.xml",
+    ];
+
+    for entry in xml_entries {
+        if let Ok(mut xml) = archive.by_name(entry) {
+            if xml.size() > MAX_DOC_XML_READ_BYTES {
+                continue;
+            }
+
+            let mut buffer = String::new();
+            if xml.read_to_string(&mut buffer).is_ok() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&extract_text_from_xml(&buffer));
+            }
+        }
+    }
+
+    if combined.trim().is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+fn extract_odt_text(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut xml = archive.by_name("content.xml").ok()?;
+    if xml.size() > MAX_DOC_XML_READ_BYTES {
+        return None;
+    }
+
+    let mut content = String::new();
+    xml.read_to_string(&mut content).ok()?;
+    let extracted = extract_text_from_xml(&content);
+    if extracted.trim().is_empty() {
+        None
+    } else {
+        Some(extracted)
+    }
+}
+
+fn extract_text_from_xml(xml: &str) -> String {
+    let mut output = String::new();
+    let mut inside_tag = false;
+    let mut tag_buffer = String::new();
+
+    for ch in xml.chars() {
+        if inside_tag {
+            if ch == '>' {
+                let lowered = tag_buffer.trim().to_lowercase();
+                if lowered.starts_with("w:p")
+                    || lowered.starts_with("/w:p")
+                    || lowered.starts_with("text:p")
+                    || lowered.starts_with("/text:p")
+                    || lowered.starts_with("text:h")
+                    || lowered.starts_with("/text:h")
+                    || lowered.starts_with("text:line-break")
+                    || lowered.starts_with("w:br")
+                {
+                    output.push('\n');
+                } else if lowered.starts_with("w:tab") || lowered.starts_with("text:tab") {
+                    output.push('\t');
+                }
+
+                tag_buffer.clear();
+                inside_tag = false;
+                continue;
+            }
+
+            tag_buffer.push(ch);
+            continue;
+        }
+
+        if ch == '<' {
+            inside_tag = true;
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    decode_xml_entities(&output)
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#10;", "\n")
+        .replace("&#9;", "\t")
+}
+
+fn extract_rtf_text(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let slice = &bytes[..bytes.len().min(MAX_TEXT_READ_BYTES)];
+    let content = String::from_utf8_lossy(slice);
+
+    let mut output = String::new();
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let ch = chars[index];
+
+        if ch == '\\' {
+            index += 1;
+            if index >= chars.len() {
+                break;
+            }
+
+            let escaped = chars[index];
+            if escaped == '\\' || escaped == '{' || escaped == '}' {
+                output.push(escaped);
+                index += 1;
+                continue;
+            }
+
+            while index < chars.len() && chars[index].is_alphabetic() {
+                index += 1;
+            }
+
+            if index < chars.len() && (chars[index] == '-' || chars[index].is_ascii_digit()) {
+                index += 1;
+                while index < chars.len() && chars[index].is_ascii_digit() {
+                    index += 1;
+                }
+            }
+
+            if index < chars.len() && chars[index] == ' ' {
+                index += 1;
+            }
+
+            continue;
+        }
+
+        if ch != '{' && ch != '}' {
+            output.push(ch);
+        }
+
+        index += 1;
+    }
+
+    if output.trim().is_empty() {
+        None
+    } else {
+        Some(output)
     }
 }
 
