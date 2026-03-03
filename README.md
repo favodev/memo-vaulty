@@ -1,18 +1,23 @@
 # MEMOVAULT
 
-MemoVault es una app de búsqueda inteligente local-first para encontrar información en tus archivos de forma rápida, con enfoque en privacidad y experiencia minimalista.
+MemoVault es un indexador y buscador local de texto, enfocado en velocidad, privacidad y simplicidad.
 
-## Qué hace la app
+## Alcance actual
 
-- Busca por contenido y por nombre dentro de tus documentos.
-- Permite indexar carpetas locales y mantener el índice actualizado.
-- Muestra resultados con contexto y acciones rápidas.
-- Incluye vista previa rápida de archivos sin salir de la app.
-- Ofrece modo de búsqueda semántica con proveedor local o cloud.
-- Integra chat con tus propios datos con citas de fuentes.
+- Indexación local de archivos de texto y documentos.
+- Búsqueda por contenido y metadatos locales.
+- Vista previa de texto dentro de la app.
+- Reindexado manual y automático con watcher.
+- Exportación e importación de configuración.
 
-## Enfoque del producto
+## Formatos soportados
 
-- Local-first y control de datos por parte del usuario.
-- Interfaz simple, directa y centrada en productividad.
-- Base multiplataforma con frontend React y backend Tauri/Rust.
+- Texto plano y markup: TXT, MD, CSV, LOG, JSON, YAML, TOML, INI.
+- Código y configuración: TS/JS, RS, PY, TF, HCL, SQL, entre otros.
+- Documentos: PDF, DOCX, ODT, RTF, PPTX, XLSX.
+
+## Arquitectura
+
+- Frontend: React + TypeScript + Tailwind + Framer Motion.
+- Backend: Tauri + Rust.
+- Índice local persistente para búsqueda rápida.

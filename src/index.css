@@ -4,7 +4,7 @@ body {
   background-color: #020203;
   color: white;
   -webkit-font-smoothing: antialiased;
-  overflow: hidden;
+  overflow: auto;
 }
 
 .vault-scroll {
