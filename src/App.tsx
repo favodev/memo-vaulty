@@ -324,6 +324,7 @@ function App() {
   const loadQuickLook = async (path: string) => {
     setIsQuickLookOpen(true);
     setQuickLookPath(path);
+    setQuickLookPreview(null);
     setIsQuickLookLoading(true);
     try {
       const preview = await invoke<FileTextPreview>("get_file_text_preview", { path, maxChars: 18000 });

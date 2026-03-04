@@ -192,11 +192,11 @@ fn get_file_text_preview(path: String, max_chars: Option<usize>) -> Result<FileT
 
     let maybe_text = match extension.as_str() {
         "pdf" => extract_pdf_text(&file_path).map(|(v, _)| v),
-        "docx" => extract_docx_text(&file_path),
-        "odt" => extract_odt_text(&file_path),
+        "docx" | "docm" => extract_docx_text(&file_path),
+        "odt" | "ods" | "odp" => extract_odt_text(&file_path),
         "rtf" => extract_rtf_text(&file_path),
-        "pptx" => extract_pptx_text(&file_path),
-        "xlsx" => extract_xlsx_text(&file_path),
+        "pptx" | "pptm" => extract_pptx_text(&file_path),
+        "xlsx" | "xlsm" => extract_xlsx_text(&file_path),
         _ => extract_generic_text(&file_path, &extension),
     };
 
@@ -731,7 +731,7 @@ fn build_index_files(
     let mut pdf_scanned = 0usize;
     let mut pdf_indexed = 0usize;
     let mut pdf_failed = 0usize;
-    let pdf_fallback_used = 0usize;
+    let mut pdf_fallback_used = 0usize;
     let mut pdf_failed_examples: Vec<String> = Vec::new();
 
     let mut stack: Vec<(PathBuf, usize)> = roots.iter().cloned().map(|v| (v, 0usize)).collect();
@@ -851,11 +851,28 @@ fn build_index_files(
                 }
             }
 
-            let extracted = extract_indexable_text(&path);
+            let (extracted, used_pdf_fallback) = if is_pdf {
+                match extract_pdf_text(&path) {
+                    Some((pdf_text, used_fallback)) => {
+                        let normalized = normalize_text_for_index(&pdf_text, 140_000);
+                        if normalized.is_empty() {
+                            (None, used_fallback)
+                        } else {
+                            (Some(normalized), used_fallback)
+                        }
+                    }
+                    None => (None, false),
+                }
+            } else {
+                (extract_indexable_text(&path), false)
+            };
 
             if is_pdf {
                 if extracted.is_some() {
                     pdf_indexed += 1;
+                    if used_pdf_fallback {
+                        pdf_fallback_used = pdf_fallback_used.saturating_add(1);
+                    }
                 } else {
                     pdf_failed += 1;
                     if pdf_failed_examples.len() < 6 {
@@ -1146,6 +1163,34 @@ fn search_local_files(
                     match_reason: "El nombre del archivo contiene todos los términos de búsqueda.".to_string(),
                     origin: "local-filename".to_string(),
                 });
+                continue;
+            }
+
+            let extension = path
+                .extension()
+                .and_then(|v| v.to_str())
+                .map(|v| v.to_lowercase())
+                .unwrap_or_default();
+
+            if !is_supported_text_extension(&extension) {
+                continue;
+            }
+
+            if file_size > 2 * 1024 * 1024 {
+                continue;
+            }
+
+            if let Some(content) = extract_generic_text(&path, &extension) {
+                let lowered = content.to_lowercase();
+                if query_tokens.iter().all(|t| lowered.contains(t)) {
+                    results.push(SearchResultItem {
+                        title: file_name.to_string(),
+                        path: path.to_string_lossy().to_string(),
+                        snippet: build_local_file_snippet(&content, &query_tokens),
+                        match_reason: "Coincidencia por contenido (sin índice activo).".to_string(),
+                        origin: "local-content-fallback".to_string(),
+                    });
+                }
             }
         }
 
@@ -1500,11 +1545,11 @@ fn extract_indexable_text(path: &Path) -> Option<String> {
 
     let content = match extension.as_str() {
         "pdf" => extract_pdf_text(path).map(|(v, _)| v),
-        "docx" => extract_docx_text(path),
-        "odt" => extract_odt_text(path),
+        "docx" | "docm" => extract_docx_text(path),
+        "odt" | "ods" | "odp" => extract_odt_text(path),
         "rtf" => extract_rtf_text(path),
-        "pptx" => extract_pptx_text(path),
-        "xlsx" => extract_xlsx_text(path),
+        "pptx" | "pptm" => extract_pptx_text(path),
+        "xlsx" | "xlsm" => extract_xlsx_text(path),
         _ => extract_generic_text(path, &extension),
     }?;
 
@@ -1623,6 +1668,10 @@ fn extract_docx_text(path: &Path) -> Option<String> {
 }
 
 fn extract_odt_text(path: &Path) -> Option<String> {
+    extract_odf_package_text(path)
+}
+
+fn extract_odf_package_text(path: &Path) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
     let mut xml = archive.by_name("content.xml").ok()?;
@@ -1648,7 +1697,10 @@ fn extract_pptx_text(path: &Path) -> Option<String> {
     let mut combined = String::new();
 
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).ok()?;
+        let mut entry = match archive.by_index(index) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         let name = entry.name().to_string();
         if !name.starts_with("ppt/slides/slide") || !name.ends_with(".xml") {
             continue;
@@ -1694,7 +1746,10 @@ fn extract_xlsx_text(path: &Path) -> Option<String> {
     }
 
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).ok()?;
+        let mut entry = match archive.by_index(index) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         let name = entry.name().to_string();
         if !name.starts_with("xl/worksheets/") || !name.ends_with(".xml") {
             continue;
@@ -1911,11 +1966,16 @@ fn is_supported_text_extension(extension: &str) -> bool {
             | "vtt"
             | "po"
             | "docx"
+            | "docm"
             | "odt"
+            | "ods"
+            | "odp"
             | "rtf"
             | "pdf"
             | "pptx"
+            | "pptm"
             | "xlsx"
+            | "xlsm"
             | "tf"
             | "tfvars"
             | "hcl"
@@ -2026,6 +2086,23 @@ fn build_chunk_snippet(content: &str, query: &str) -> String {
     format!("Coincidencia en chunk: {}", snippet)
 }
 
+fn build_local_file_snippet(content: &str, query_tokens: &[String]) -> String {
+    if content.is_empty() {
+        return "Coincidencia por contenido local.".to_string();
+    }
+
+    let lowered = content.to_lowercase();
+    let position = query_tokens
+        .iter()
+        .filter_map(|token| lowered.find(token))
+        .min()
+        .unwrap_or(0);
+
+    let start_char = lowered[..position].chars().count().saturating_sub(55);
+    let snippet: String = content.chars().skip(start_char).take(200).collect();
+    format!("Coincidencia en contenido local: {}", normalize_text_for_index(&snippet, 200))
+}
+
 fn build_index_snippet(item: &IndexedFileItem, query_tokens: &[String]) -> String {
     if let Some(content) = &item.content_excerpt {
         let lowered = content.to_lowercase();
@@ -2091,10 +2168,15 @@ fn needs_content_refresh(path: &Path, previous: &IndexedFileItem) -> bool {
 
     extension == "pdf"
         || extension == "docx"
+        || extension == "docm"
         || extension == "odt"
+        || extension == "ods"
+        || extension == "odp"
         || extension == "rtf"
         || extension == "pptx"
+        || extension == "pptm"
         || extension == "xlsx"
+        || extension == "xlsm"
         || is_supported_text_extension(&extension)
 }
 
