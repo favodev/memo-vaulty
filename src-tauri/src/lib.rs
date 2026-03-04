@@ -108,7 +108,7 @@ struct FileWatcherRuntime {
     thread: std::thread::JoinHandle<()>,
 }
 
-#[derive(Clone, Serialize, Default)]
+#[derive(Clone, Serialize)]
 struct FileWatcherStatus {
     running: bool,
     roots: Vec<String>,
@@ -124,6 +124,25 @@ struct FileWatcherStatus {
     last_error: Option<String>,
 }
 
+impl Default for FileWatcherStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            roots: Vec::new(),
+            pending_events: false,
+            debounce_ms: 1200,
+            last_event_at: None,
+            last_event_kind: None,
+            pending_event_count: 0,
+            total_event_count: 0,
+            last_batch_event_count: 0,
+            last_batch_reason: None,
+            last_reindex_at: None,
+            last_error: None,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ExportableAppConfig {
     version: u32,
@@ -131,6 +150,16 @@ struct ExportableAppConfig {
     excluded_extensions: Vec<String>,
     excluded_folders: Vec<String>,
     max_file_size_mb: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedAppConfig {
+    version: u32,
+    roots: Vec<String>,
+    excluded_extensions: Vec<String>,
+    excluded_folders: Vec<String>,
+    max_file_size_mb: u64,
+    watcher_debounce_ms: u64,
 }
 
 struct AppState {
@@ -335,6 +364,13 @@ fn start_indexing(
         max_file_size_mb,
     )?;
 
+    let watcher_debounce_ms = state
+        .watcher_status
+        .lock()
+        .map(|v| v.debounce_ms.max(300))
+        .unwrap_or(1200);
+    let _ = save_persisted_app_config(&app, &settings, watcher_debounce_ms);
+
     execute_indexing(&app, state.inner(), settings, "manual")
 }
 
@@ -361,7 +397,16 @@ fn cancel_indexing(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn clear_index_data(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<IndexStatus, String> {
-    clear_index_data_internal(&app, state.inner())
+    let status = clear_index_data_internal(&app, state.inner())?;
+    if let Ok(settings) = state.index_settings.lock() {
+        let watcher_debounce_ms = state
+            .watcher_status
+            .lock()
+            .map(|v| v.debounce_ms.max(300))
+            .unwrap_or(1200);
+        let _ = save_persisted_app_config(&app, &settings, watcher_debounce_ms);
+    }
+    Ok(status)
 }
 
 #[tauri::command]
@@ -389,6 +434,13 @@ fn forget_index_root(
         }
         settings.clone()
     };
+
+    let watcher_debounce_ms = state
+        .watcher_status
+        .lock()
+        .map(|v| v.debounce_ms.max(300))
+        .unwrap_or(1200);
+    let _ = save_persisted_app_config(&app, &updated_settings, watcher_debounce_ms);
 
     if updated_settings.roots.is_empty() {
         return clear_index_data_internal(&app, state.inner());
@@ -445,6 +497,8 @@ fn start_file_watcher(
         status.debounce_ms = debounce_value;
         status.last_error = None;
     });
+
+    let _ = save_persisted_app_config(&app, &settings, debounce_value);
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_thread = stop_flag.clone();
@@ -595,6 +649,13 @@ fn import_app_config_from_file(
             .map_err(|_| "No se pudo aplicar configuración".to_string())?;
         *settings = sanitized.clone();
     }
+
+    let watcher_debounce_ms = state
+        .watcher_status
+        .lock()
+        .map(|v| v.debounce_ms.max(300))
+        .unwrap_or(1200);
+    let _ = save_persisted_app_config(&app, &sanitized, watcher_debounce_ms);
 
     if reindex.unwrap_or(true) && !sanitized.roots.is_empty() {
         execute_indexing(&app, state.inner(), sanitized, "manual")
@@ -941,7 +1002,8 @@ fn search_in_index(
     max_file_size_bytes: u64,
     max_results: usize,
 ) -> Option<Vec<SearchResultItem>> {
-    let tokens = tokenize_query(query);
+    let normalized_query = normalize_for_search_text(query);
+    let tokens = tokenize_query(&normalized_query);
     if tokens.is_empty() {
         return Some(Vec::new());
     }
@@ -961,7 +1023,18 @@ fn search_in_index(
             continue;
         }
 
-        let score = compute_lexical_score(&item.search_key, &tokens, &query.to_lowercase());
+        let searchable = normalize_for_search_text(&format!(
+            "{} {} {}",
+            item.title,
+            item.path,
+            item.content_excerpt.as_deref().unwrap_or_default()
+        ));
+
+        if !matches_query_strict(&searchable, &tokens, &normalized_query) {
+            continue;
+        }
+
+        let score = compute_lexical_score(&searchable, &tokens, &normalized_query);
         if score > 0.0 {
             scored.push((item, score));
         }
@@ -993,7 +1066,8 @@ fn search_in_chunk_db(
     max_file_size_bytes: u64,
     max_results: usize,
 ) -> Result<Vec<SearchResultItem>, String> {
-    let tokens = tokenize_query(query);
+    let normalized_query = normalize_for_search_text(query);
+    let tokens = tokenize_query(&normalized_query);
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
@@ -1030,7 +1104,6 @@ fn search_in_chunk_db(
         })
         .map_err(|err| format!("No se pudo ejecutar consulta local: {err}"))?;
 
-    let lowered_query = query.to_lowercase();
     let mut best_by_path = HashMap::<String, (String, String, f32)>::new();
 
     for row in rows.flatten() {
@@ -1048,7 +1121,12 @@ fn search_in_chunk_db(
             continue;
         }
 
-        let score = compute_lexical_score(&search_key, &tokens, &lowered_query);
+        let searchable = normalize_for_search_text(&format!("{} {} {} {}", title, path, chunk_text, search_key));
+        if !matches_query_strict(&searchable, &tokens, &normalized_query) {
+            continue;
+        }
+
+        let score = compute_lexical_score(&searchable, &tokens, &normalized_query);
         if score <= 0.0 {
             continue;
         }
@@ -1089,7 +1167,8 @@ fn search_local_files(
 ) -> Vec<SearchResultItem> {
     const MAX_DEPTH: usize = 8;
 
-    let query_tokens = tokenize_query(query);
+    let normalized_query = normalize_for_search_text(query);
+    let query_tokens = tokenize_query(&normalized_query);
     if query_tokens.is_empty() {
         return Vec::new();
     }
@@ -1154,8 +1233,8 @@ fn search_local_files(
                 None => continue,
             };
 
-            let lowered_name = file_name.to_lowercase();
-            if query_tokens.iter().all(|t| lowered_name.contains(t)) {
+            let lowered_name = normalize_for_search_text(file_name);
+            if matches_query_strict(&lowered_name, &query_tokens, &normalized_query) {
                 results.push(SearchResultItem {
                     title: file_name.to_string(),
                     path: path.to_string_lossy().to_string(),
@@ -1181,8 +1260,8 @@ fn search_local_files(
             }
 
             if let Some(content) = extract_generic_text(&path, &extension) {
-                let lowered = content.to_lowercase();
-                if query_tokens.iter().all(|t| lowered.contains(t)) {
+                let lowered = normalize_for_search_text(&content);
+                if matches_query_strict(&lowered, &query_tokens, &normalized_query) {
                     results.push(SearchResultItem {
                         title: file_name.to_string(),
                         path: path.to_string_lossy().to_string(),
@@ -1229,7 +1308,7 @@ fn rebuild_chunk_db(app: &tauri::AppHandle, items: &[IndexedFileItem]) -> Result
         }
 
         for (chunk_index, chunk_text) in chunks.into_iter().enumerate() {
-            let search_key = format!("{} {}", item.title.to_lowercase(), chunk_text.to_lowercase());
+            let search_key = normalize_for_search_text(&format!("{} {} {}", item.title, item.path, chunk_text));
 
             tx.execute(
                 "INSERT INTO chunks (path, title, chunk_index, chunk_text, search_key, size_bytes, modified_unix_secs, updated_unix_secs)
@@ -2036,12 +2115,60 @@ fn normalize_text_for_index(content: &str, max_chars: usize) -> String {
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
-    query
-        .to_lowercase()
+    normalize_for_search_text(query)
         .split(|c: char| !c.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn normalize_for_search_text(value: &str) -> String {
+    let lower = value.to_lowercase();
+    let folded = lower
+        .replace('á', "a")
+        .replace('à', "a")
+        .replace('ä', "a")
+        .replace('â', "a")
+        .replace('ã', "a")
+        .replace('å', "a")
+        .replace('é', "e")
+        .replace('è', "e")
+        .replace('ë', "e")
+        .replace('ê', "e")
+        .replace('í', "i")
+        .replace('ì', "i")
+        .replace('ï', "i")
+        .replace('î', "i")
+        .replace('ó', "o")
+        .replace('ò', "o")
+        .replace('ö', "o")
+        .replace('ô', "o")
+        .replace('õ', "o")
+        .replace('ú', "u")
+        .replace('ù', "u")
+        .replace('ü', "u")
+        .replace('û', "u")
+        .replace('ñ', "n");
+
+    folded
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn matches_query_strict(searchable: &str, tokens: &[String], normalized_query: &str) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+
+    if tokens.len() == 1 {
+        return searchable.contains(&tokens[0]);
+    }
+
+    searchable.contains(normalized_query)
 }
 
 fn compute_lexical_score(search_key: &str, tokens: &[String], lowered_query: &str) -> f32 {
@@ -2374,10 +2501,75 @@ fn save_index_snapshot(app: &tauri::AppHandle, snapshot: &IndexSnapshot) {
     let _ = fs::write(path, serialized);
 }
 
+fn persisted_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("app-config.json");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    Some(path)
+}
+
+fn save_persisted_app_config(
+    app: &tauri::AppHandle,
+    settings: &IndexingSettings,
+    watcher_debounce_ms: u64,
+) -> Result<(), String> {
+    let payload = PersistedAppConfig {
+        version: 1,
+        roots: settings.roots.clone(),
+        excluded_extensions: settings.excluded_extensions.clone(),
+        excluded_folders: settings.excluded_folders.clone(),
+        max_file_size_mb: settings.max_file_size_mb.max(1),
+        watcher_debounce_ms: watcher_debounce_ms.clamp(300, 30_000),
+    };
+
+    let path = persisted_config_path(app).ok_or_else(|| "No se pudo resolver ruta de configuración".to_string())?;
+    let serialized = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("No se pudo serializar configuración persistida: {err}"))?;
+
+    fs::write(path, serialized)
+        .map_err(|err| format!("No se pudo guardar configuración persistida: {err}"))
+}
+
+fn load_persisted_app_config(app: &tauri::AppHandle) -> Option<PersistedAppConfig> {
+    let path = persisted_config_path(app)?;
+    let content = fs::read_to_string(path).ok()?;
+    let parsed = serde_json::from_str::<PersistedAppConfig>(&content).ok()?;
+    if parsed.version != 1 {
+        return None;
+    }
+    Some(parsed)
+}
+
 fn load_index_snapshot(app: &tauri::AppHandle) -> Option<IndexSnapshot> {
     let path = index_cache_path(app)?;
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str::<IndexSnapshot>(&content).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_removes_diacritics() {
+        let normalized = normalize_for_search_text("Quiero cÓmEr mañana");
+        assert_eq!(normalized, "quiero comer manana");
+    }
+
+    #[test]
+    fn strict_phrase_requires_adjacent_words() {
+        let query = normalize_for_search_text("quiero comer");
+        let tokens = tokenize_query(&query);
+
+        let ok = normalize_for_search_text("hoy quiero comer pizza");
+        let bad = normalize_for_search_text("hoy quiero y despues comer pizza");
+        let bad_partial = normalize_for_search_text("solo comer pizza");
+
+        assert!(matches_query_strict(&ok, &tokens, &query));
+        assert!(!matches_query_strict(&bad, &tokens, &query));
+        assert!(!matches_query_strict(&bad_partial, &tokens, &query));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2388,6 +2580,18 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
+            if let Some(saved) = load_persisted_app_config(app.handle()) {
+                if let Ok(mut settings) = app.state::<AppState>().index_settings.lock() {
+                    settings.roots = saved.roots.clone();
+                    settings.excluded_extensions = saved.excluded_extensions;
+                    settings.excluded_folders = saved.excluded_folders;
+                    settings.max_file_size_mb = saved.max_file_size_mb.max(1);
+                }
+                if let Ok(mut watcher_status) = app.state::<AppState>().watcher_status.lock() {
+                    watcher_status.debounce_ms = saved.watcher_debounce_ms.clamp(300, 30_000);
+                }
+            }
+
             if let Some(snapshot) = load_index_snapshot(app.handle()) {
                 let snapshot_roots = snapshot.roots.clone();
                 if let Ok(mut guard) = app.state::<AppState>().index.lock() {

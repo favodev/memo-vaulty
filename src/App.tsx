@@ -77,6 +77,12 @@ function unixToDate(value: string | null): string {
   return new Date(numeric * 1000).toLocaleString();
 }
 
+function getPathTail(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
 function App() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -103,8 +109,10 @@ function App() {
   const [quickLookPreview, setQuickLookPreview] = useState<FileTextPreview | null>(null);
   const [isQuickLookOpen, setIsQuickLookOpen] = useState(false);
   const [isQuickLookLoading, setIsQuickLookLoading] = useState(false);
+  const [isLiveSearchEnabled] = useState(true);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchRequestIdRef = useRef(0);
 
   const selectedItem = useMemo(() => {
     if (selectedIndex < 0 || selectedIndex >= results.length) return null;
@@ -134,8 +142,8 @@ function App() {
     }
   };
 
-  const runSearch = async () => {
-    const clean = query.trim();
+  const executeSearch = async (rawQuery: string) => {
+    const clean = rawQuery.trim();
     if (!clean) {
       setResults([]);
       setSelectedIndex(-1);
@@ -144,6 +152,7 @@ function App() {
       return;
     }
 
+    const requestId = ++searchRequestIdRef.current;
     setIsLoading(true);
     setHasSearched(true);
     setErrorMessage(null);
@@ -173,18 +182,28 @@ function App() {
         });
       }
 
-      setResults(response);
-      setSelectedIndex(response.length > 0 ? 0 : -1);
-      if (response.length > 0) {
-        setQuickLookPath(response[0].path);
+      if (requestId === searchRequestIdRef.current) {
+        setResults(response);
+        setSelectedIndex(response.length > 0 ? 0 : -1);
+        if (response.length > 0) {
+          setQuickLookPath(response[0].path);
+        }
       }
     } catch {
-      setResults([]);
-      setSelectedIndex(-1);
-      setErrorMessage("No se pudo ejecutar la búsqueda local.");
+      if (requestId === searchRequestIdRef.current) {
+        setResults([]);
+        setSelectedIndex(-1);
+        setErrorMessage("No se pudo ejecutar la búsqueda local.");
+      }
     } finally {
-      setIsLoading(false);
+      if (requestId === searchRequestIdRef.current) {
+        setIsLoading(false);
+      }
     }
+  };
+
+  const runSearch = async () => {
+    await executeSearch(query);
   };
 
   const startIndexing = async () => {
@@ -216,6 +235,14 @@ function App() {
     } catch {
       setErrorMessage("No se pudo cancelar la indexación.");
     }
+  };
+
+  const handleIndexPrimaryAction = async () => {
+    if (isIndexing) {
+      await cancelIndexing();
+      return;
+    }
+    await startIndexing();
   };
 
   const toggleWatcher = async () => {
@@ -341,6 +368,33 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!isLiveSearchEnabled) return;
+
+    const clean = query.trim();
+    if (!clean) {
+      setResults([]);
+      setSelectedIndex(-1);
+      setHasSearched(false);
+      setErrorMessage(null);
+      return;
+    }
+
+    if (clean.length < 2) {
+      setResults([]);
+      setSelectedIndex(-1);
+      setHasSearched(false);
+      return;
+    }
+
+    const debounceMs = isIndexing ? 420 : 280;
+    const timer = window.setTimeout(() => {
+      void executeSearch(clean);
+    }, debounceMs);
+
+    return () => window.clearTimeout(timer);
+  }, [query, isIndexing, isLiveSearchEnabled]);
+
+  useEffect(() => {
     if (!watcherStatus?.running) return;
     const timer = setInterval(() => {
       void invoke<FileWatcherStatus>("get_file_watcher_status")
@@ -420,9 +474,19 @@ function App() {
   }, [selectedItem]);
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100">
-      <div className="mx-auto grid min-h-screen w-full max-w-350 grid-cols-1 gap-4 p-4 lg:grid-cols-[320px_1fr]">
-        <aside className="rounded-2xl border border-zinc-800/80 bg-zinc-900/70 p-4 backdrop-blur">
+    <div className="relative min-h-screen overflow-hidden bg-black text-zinc-100">
+      <div className="pointer-events-none absolute inset-0">
+        <div className="absolute -left-28 top-8 h-72 w-72 rounded-full bg-emerald-500/8 blur-3xl" />
+        <div className="absolute right-0 top-0 h-80 w-80 rounded-full bg-cyan-500/6 blur-3xl" />
+        <div className="absolute bottom-0 left-1/3 h-64 w-64 rounded-full bg-violet-500/6 blur-3xl" />
+      </div>
+      <div className="mx-auto grid min-h-screen w-full max-w-400 grid-cols-1 gap-4 p-4 lg:grid-cols-[340px_1fr]">
+        <motion.aside
+          initial={{ opacity: 0, x: -10 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ duration: 0.25, ease: "easeOut" }}
+          className="rounded-3xl border border-zinc-800/80 bg-linear-to-b from-black via-zinc-950/80 to-black p-4 shadow-2xl shadow-black/40 backdrop-blur"
+        >
           <div className="mb-4 flex items-center justify-between">
             <h1 className="text-lg font-semibold tracking-tight">MemoVault</h1>
             <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-xs text-emerald-300">
@@ -431,41 +495,93 @@ function App() {
           </div>
 
           <div className="space-y-3">
-            <button
+            <motion.button
               type="button"
               onClick={pickFolders}
-              className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm transition hover:border-zinc-500 hover:bg-zinc-700"
+              whileHover={{ y: -1 }}
+              whileTap={{ scale: 0.99 }}
+              className="w-full rounded-2xl border border-zinc-700/80 bg-zinc-900/80 px-3 py-2.5 text-sm font-medium transition hover:border-zinc-500 hover:bg-zinc-800"
             >
               + Añadir carpetas
-            </button>
+            </motion.button>
 
-            <button
+            <motion.button
               type="button"
-              onClick={startIndexing}
-              disabled={isIndexing}
-              className="w-full rounded-lg bg-emerald-500 px-3 py-2 text-sm font-medium text-zinc-900 transition hover:bg-emerald-400 disabled:opacity-60"
+              onClick={() => void handleIndexPrimaryAction()}
+              whileHover={{ y: -1 }}
+              whileTap={{ scale: 0.99 }}
+              className={`w-full rounded-xl px-3 py-2.5 text-sm font-semibold transition ${
+                isIndexing
+                  ? "border border-amber-400/30 bg-amber-500/20 text-amber-200 hover:bg-amber-500/30"
+                  : "bg-emerald-500 text-zinc-950 shadow-lg shadow-emerald-500/20 hover:bg-emerald-400"
+              }`}
             >
-              {isIndexing ? "Indexando..." : "Indexar ahora"}
-            </button>
+              {isIndexing ? "Pausar / cancelar indexación" : "Indexar ahora"}
+            </motion.button>
 
-            <button
-              type="button"
-              onClick={cancelIndexing}
-              className="w-full rounded-lg border border-zinc-700 px-3 py-2 text-sm transition hover:border-zinc-500"
-            >
-              Cancelar indexación
-            </button>
-
-            <button
+            <motion.button
               type="button"
               onClick={() => setIsConfigOpen(true)}
-              className="w-full rounded-lg border border-zinc-700 px-3 py-2 text-sm transition hover:border-zinc-500"
+              whileHover={{ y: -1 }}
+              whileTap={{ scale: 0.99 }}
+              className="w-full rounded-2xl border border-zinc-700/80 px-3 py-2.5 text-sm transition hover:border-zinc-500"
             >
               Configuración
-            </button>
+            </motion.button>
           </div>
 
-          <div className="mt-5 space-y-2 rounded-xl border border-zinc-800 p-3 text-xs text-zinc-300">
+          <div className="mt-5 rounded-2xl border border-zinc-800/80 bg-zinc-900/40 p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-xs font-medium uppercase tracking-wide text-zinc-400">Carpetas activas</p>
+              <span className="rounded-md border border-zinc-700 px-2 py-0.5 text-[10px] text-zinc-300">
+                {searchRoots.length}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 gap-2">
+              {searchRoots.length === 0 ? (
+                <p className="text-xs text-zinc-500">Aún no agregas carpetas para indexar.</p>
+              ) : (
+                searchRoots.map((root) => (
+                  <motion.div
+                    key={root}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    whileHover={{ y: -1 }}
+                    className="rounded-xl border border-zinc-800/90 bg-zinc-900/80 px-2.5 py-2 text-xs"
+                  >
+                    <div className="flex items-start gap-2">
+                      <div className="mt-0.5 grid h-7 w-7 place-items-center rounded-lg border border-zinc-700 bg-zinc-950 text-zinc-300">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4.3a2 2 0 0 1 1.4.58l1.22 1.22a2 2 0 0 0 1.41.58H18.5A2.5 2.5 0 0 1 21 10v8.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 18.5Z"/></svg>
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[11px] font-medium text-zinc-300" title={getPathTail(root)}>{getPathTail(root)}</p>
+                        <p className="truncate text-[10px] text-zinc-500" title={root}>{root}</p>
+                      </div>
+                    </div>
+                    <div className="mt-2 flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => removeRoot(root)}
+                        className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-zinc-500"
+                      >
+                        Quitar
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void removeRootPersisted(root)}
+                        className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-zinc-500"
+                      >
+                        Olvidar
+                      </button>
+                    </div>
+                  </motion.div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="mt-4 space-y-2 rounded-xl border border-zinc-800/80 bg-zinc-900/40 p-3 text-xs text-zinc-300">
             <div className="flex items-center justify-between">
               <span>Watcher</span>
               <button
@@ -497,15 +613,20 @@ function App() {
             <div>Archivos indexados: {indexStatus?.indexed_files ?? 0}</div>
             <div>Última indexación: {unixToDate(indexStatus?.indexed_at ?? null)}</div>
             {indexProgress ? (
-              <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-2 text-zinc-300">
+              <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-2 text-zinc-300">
                 {indexProgress.message} · {indexProgress.indexed_files} archivos
               </div>
             ) : null}
           </div>
-        </aside>
+        </motion.aside>
 
-        <main className="rounded-2xl border border-zinc-800/80 bg-zinc-900/50 p-4 backdrop-blur">
-          <div className="mb-4 flex flex-col gap-3 md:flex-row">
+        <motion.main
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.25, ease: "easeOut", delay: 0.06 }}
+          className="rounded-3xl border border-zinc-800/80 bg-linear-to-b from-zinc-950/80 via-black to-black p-4 shadow-2xl shadow-black/40 backdrop-blur"
+        >
+          <div className="mb-1 flex flex-col gap-3 md:flex-row">
             <input
               ref={searchInputRef}
               value={query}
@@ -517,16 +638,26 @@ function App() {
                 }
               }}
               placeholder="Buscar en texto, markdown, código, PDFs, DOCX, ODT, RTF..."
-              className="h-12 w-full rounded-xl border border-zinc-700 bg-zinc-950/80 px-4 text-sm outline-none transition focus:border-emerald-400"
+              className="h-12 w-full rounded-2xl border border-zinc-800 bg-black/80 px-4 text-sm outline-none transition focus:border-emerald-400"
             />
-            <button
+            <motion.button
               type="button"
               onClick={runSearch}
               disabled={isLoading}
-              className="h-12 rounded-xl bg-zinc-100 px-5 text-sm font-medium text-zinc-900 transition hover:bg-white disabled:opacity-60"
+              whileTap={{ scale: 0.98 }}
+              className="h-12 rounded-2xl bg-zinc-100 px-5 text-sm font-semibold text-zinc-900 transition hover:bg-white disabled:opacity-60"
             >
               {isLoading ? "Buscando..." : "Buscar"}
-            </button>
+            </motion.button>
+          </div>
+
+          <div className="mb-4 flex items-center gap-2 px-1 text-[11px] text-zinc-500">
+            <span className={`h-1.5 w-1.5 rounded-full ${isLoading ? "bg-emerald-400 animate-pulse" : "bg-zinc-600"}`} />
+            <span>
+              {isLiveSearchEnabled
+                ? "Búsqueda en tiempo real activa (debounce inteligente)"
+                : "Búsqueda manual"}
+            </span>
           </div>
 
           {errorMessage ? (
@@ -536,7 +667,7 @@ function App() {
           ) : null}
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1fr_380px]">
-            <section className="min-h-130 rounded-xl border border-zinc-800 bg-zinc-950/40 p-3">
+            <section className="min-h-130 rounded-2xl border border-zinc-800/90 bg-black/60 p-3">
               {hasSearched && results.length === 0 && !isLoading ? (
                 <div className="mt-12 text-center text-sm text-zinc-400">No hay resultados con esa consulta.</div>
               ) : null}
@@ -550,11 +681,12 @@ function App() {
                       initial={{ opacity: 0, y: 8 }}
                       animate={{ opacity: 1, y: 0 }}
                       transition={{ duration: 0.16, delay: index * 0.01 }}
+                      whileHover={{ y: -2, scale: 1.002 }}
                       onClick={() => setSelectedIndex(index)}
                       className={`cursor-pointer rounded-lg border p-3 transition ${
                         active
-                          ? "border-emerald-400/60 bg-emerald-500/10"
-                          : "border-zinc-800 bg-zinc-900/50 hover:border-zinc-700"
+                          ? "border-emerald-400/60 bg-emerald-500/10 shadow-lg shadow-emerald-500/10"
+                          : "border-zinc-800 bg-zinc-900/40 hover:border-zinc-700"
                       }`}
                     >
                       <div className="mb-1 flex items-center justify-between gap-3">
@@ -606,7 +738,7 @@ function App() {
               </div>
             </section>
 
-            <section className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+            <section className="rounded-2xl border border-zinc-800/90 bg-black/60 p-3">
               <h2 className="mb-2 text-sm font-medium">Diagnóstico</h2>
               <div className="space-y-2 text-xs text-zinc-300">
                 <div>Escaneados: {indexDiagnostics?.scanned_files ?? 0}</div>
@@ -622,12 +754,12 @@ function App() {
               </div>
             </section>
           </div>
-        </main>
+        </motion.main>
       </div>
 
       {isConfigOpen ? (
         <div className="fixed inset-0 z-40 grid place-items-center bg-black/60 p-4">
-          <div className="w-full max-w-2xl rounded-2xl border border-zinc-700 bg-zinc-900 p-4">
+          <div className="w-full max-w-xl rounded-2xl border border-zinc-700 bg-zinc-900 p-4">
             <div className="mb-3 flex items-center justify-between">
               <h3 className="text-base font-semibold">Configuración</h3>
               <button
@@ -639,96 +771,56 @@ function App() {
               </button>
             </div>
 
-            <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-3">
               <div>
-                <label className="mb-1 block text-xs text-zinc-400">Carpetas indexadas</label>
-                <div className="vault-scroll max-h-48 space-y-2 overflow-auto rounded-lg border border-zinc-800 p-2">
-                  {searchRoots.length === 0 ? (
-                    <p className="text-xs text-zinc-500">Sin carpetas seleccionadas.</p>
-                  ) : (
-                    searchRoots.map((root) => (
-                      <div key={root} className="flex items-center justify-between gap-2 rounded border border-zinc-800 p-2 text-xs">
-                        <span className="truncate text-zinc-300">{root}</span>
-                        <div className="flex gap-1">
-                          <button
-                            type="button"
-                            onClick={() => removeRoot(root)}
-                            className="rounded border border-zinc-700 px-2 py-0.5 text-[11px] hover:border-zinc-500"
-                          >
-                            Quitar
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void removeRootPersisted(root)}
-                            className="rounded border border-zinc-700 px-2 py-0.5 text-[11px] hover:border-zinc-500"
-                          >
-                            Olvidar
-                          </button>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={pickFolders}
-                  className="mt-2 rounded-md border border-zinc-700 px-3 py-1.5 text-xs hover:border-zinc-500"
-                >
-                  Añadir carpetas
-                </button>
+                <label className="mb-1 block text-xs text-zinc-400">Carpetas excluidas</label>
+                <input
+                  value={excludedFolders}
+                  onChange={(event) => setExcludedFolders(event.target.value)}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-emerald-400"
+                />
               </div>
 
-              <div className="space-y-3">
-                <div>
-                  <label className="mb-1 block text-xs text-zinc-400">Carpetas excluidas</label>
-                  <input
-                    value={excludedFolders}
-                    onChange={(event) => setExcludedFolders(event.target.value)}
-                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-emerald-400"
-                  />
-                </div>
+              <div>
+                <label className="mb-1 block text-xs text-zinc-400">Tamaño máximo por archivo (MB)</label>
+                <input
+                  value={maxFileSizeMb}
+                  onChange={(event) => setMaxFileSizeMb(event.target.value)}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-emerald-400"
+                />
+              </div>
 
-                <div>
-                  <label className="mb-1 block text-xs text-zinc-400">Tamaño máximo por archivo (MB)</label>
-                  <input
-                    value={maxFileSizeMb}
-                    onChange={(event) => setMaxFileSizeMb(event.target.value)}
-                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-emerald-400"
-                  />
-                </div>
+              <div>
+                <label className="mb-1 block text-xs text-zinc-400">Watcher debounce (ms)</label>
+                <input
+                  value={watcherDebounceMs}
+                  onChange={(event) => setWatcherDebounceMs(event.target.value)}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-emerald-400"
+                />
+              </div>
 
-                <div>
-                  <label className="mb-1 block text-xs text-zinc-400">Watcher debounce (ms)</label>
-                  <input
-                    value={watcherDebounceMs}
-                    onChange={(event) => setWatcherDebounceMs(event.target.value)}
-                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-emerald-400"
-                  />
-                </div>
-
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={exportConfig}
-                    className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs hover:border-zinc-500"
-                  >
-                    Exportar config
-                  </button>
-                  <button
-                    type="button"
-                    onClick={importConfig}
-                    className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs hover:border-zinc-500"
-                  >
-                    Importar config
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void resetIndexData()}
-                    className="rounded-md border border-rose-500/40 px-3 py-1.5 text-xs text-rose-200 hover:border-rose-400"
-                  >
-                    Reset índice
-                  </button>
-                </div>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={exportConfig}
+                  className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs hover:border-zinc-500"
+                >
+                  Exportar config
+                </button>
+                <button
+                  type="button"
+                  onClick={importConfig}
+                  className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs hover:border-zinc-500"
+                >
+                  Importar config
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void resetIndexData()}
+                  className="rounded-md border border-rose-500/40 px-3 py-1.5 text-xs text-rose-200 hover:border-rose-400"
+                >
+                  Reset índice
+                </button>
               </div>
             </div>
           </div>
