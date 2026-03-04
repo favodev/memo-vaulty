@@ -10,14 +10,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arrow_array::{Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
+use lancedb::connect;
+use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::Table as LanceTable;
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
 use rusqlite::{params, params_from_iter, Connection};
 use tauri::{Emitter, Manager, State};
 
 const MAX_TEXT_READ_BYTES: usize = 512 * 1024;
 const MAX_DOC_XML_READ_BYTES: u64 = 4 * 1024 * 1024;
+const LANCEDB_BATCH_WRITE_SIZE: usize = 1000;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SearchResultItem {
     title: String,
     path: String,
@@ -246,7 +253,7 @@ fn get_file_text_preview(path: String, max_chars: Option<usize>) -> Result<FileT
 }
 
 #[tauri::command]
-async fn semantic_search(
+fn semantic_search(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     query: String,
@@ -304,28 +311,68 @@ fn search_internal(
         return Vec::new();
     }
 
+    let normalized_query = normalize_for_search_text(query);
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+
     let search_roots = resolve_roots(roots);
     let exclusions = normalize_extensions(excluded_extensions);
     let folder_exclusions = normalize_folder_rules(excluded_folders);
     let max_file_size_bytes = max_size_bytes(max_file_size_mb);
 
-    if let Ok(db_results) = search_in_chunk_db(
+    let sqlite_results = search_in_sqlite_metadata(
         app,
-        query,
+        &normalized_query,
+        &search_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+        max_results.saturating_mul(2).max(20),
+    )
+    .unwrap_or_default();
+
+    if sqlite_results.len() >= max_results && max_results > 0 {
+        return sqlite_results.into_iter().take(max_results).collect();
+    }
+
+    let lancedb_results = if normalized_query.len() >= 3 {
+        search_in_lancedb_chunks(
+            app,
+            &normalized_query,
+            &search_roots,
+            &exclusions,
+            &folder_exclusions,
+            max_file_size_bytes,
+            max_results.saturating_mul(2).max(30),
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let merged = merge_hybrid_results(sqlite_results, lancedb_results, max_results);
+    if !merged.is_empty() {
+        return merged;
+    }
+
+    let chunk_fallback = search_in_chunk_db(
+        app,
+        &normalized_query,
         &search_roots,
         &exclusions,
         &folder_exclusions,
         max_file_size_bytes,
         max_results,
-    ) {
-        if !db_results.is_empty() {
-            return db_results;
-        }
+    )
+    .unwrap_or_default();
+    if !chunk_fallback.is_empty() {
+        return chunk_fallback;
     }
 
     if let Some(index_results) = search_in_index(
         state,
-        query,
+        &normalized_query,
         &search_roots,
         &exclusions,
         &folder_exclusions,
@@ -338,7 +385,7 @@ fn search_internal(
     }
 
     search_local_files(
-        query,
+        &normalized_query,
         &search_roots,
         &exclusions,
         &folder_exclusions,
@@ -678,94 +725,123 @@ fn execute_indexing(
         return Err("Ya hay una indexación en curso".to_string());
     }
 
-    let result = (|| {
-        state.cancel_indexing.store(false, Ordering::SeqCst);
-        emit_index_progress(app, "start", "Iniciando indexación...", 0, 0, false);
+    let app_handle = app.clone();
+    let settings_owned = settings.clone();
+    let reason_owned = reason.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<IndexStatus, String>>();
 
-        let resolved_roots = resolve_roots(Some(settings.roots.clone()));
-        let exclusions = normalize_extensions(Some(settings.excluded_extensions.clone()));
-        let folder_exclusions = normalize_folder_rules(Some(settings.excluded_folders.clone()));
-        let max_file_size_bytes = max_size_bytes(Some(settings.max_file_size_mb));
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let result = execute_indexing_worker(&app_handle, state, settings_owned, &reason_owned);
+            let _ = tx.send(result);
+        });
+    });
 
-        let previous_items = state
-            .index
-            .lock()
-            .ok()
-            .and_then(|v| v.as_ref().map(|s| s.files.clone()));
-
-        let build_outcome = build_index_files(
-            app,
-            state,
-            &resolved_roots,
-            &exclusions,
-            &folder_exclusions,
-            max_file_size_bytes,
-            previous_items.as_deref(),
-        );
-
-        let diagnostics = IndexDiagnostics {
-            scanned_files: build_outcome.scanned_files,
-            indexed_files: build_outcome.files.len(),
-            pdf_scanned: build_outcome.pdf_scanned,
-            pdf_indexed: build_outcome.pdf_indexed,
-            pdf_failed: build_outcome.pdf_failed,
-            pdf_failed_examples: build_outcome.pdf_failed_examples,
-            last_error: if build_outcome.canceled {
-                Some("Indexación cancelada por el usuario".to_string())
-            } else {
-                None
-            },
-            updated_at: Some(now_timestamp_string()),
-            canceled: build_outcome.canceled,
-            chunk_db_synced: true,
-            pdf_fallback_used: build_outcome.pdf_fallback_used,
-        };
-
-        if let Ok(mut d) = state.diagnostics.lock() {
-            *d = Some(diagnostics);
-        }
-
-        if build_outcome.canceled {
-            return Err("Indexación cancelada por el usuario".to_string());
-        }
-
-        let snapshot = IndexSnapshot {
-            files: build_outcome.files,
-            roots: resolved_roots
-                .iter()
-                .map(|v| v.to_string_lossy().to_string())
-                .collect(),
-            indexed_at: now_timestamp_string(),
-        };
-
-        rebuild_chunk_db(app, &snapshot.files)?;
-        save_index_snapshot(app, &snapshot);
-
-        {
-            let mut guard = state
-                .index
-                .lock()
-                .map_err(|_| "No se pudo guardar estado de indexación".to_string())?;
-            *guard = Some(snapshot.clone());
-        }
-
-        if reason.starts_with("watcher") {
-            update_watcher_status(state, |status| {
-                status.last_reindex_at = Some(now_timestamp_string());
-                status.last_error = None;
-            });
-        }
-
-        Ok(IndexStatus {
-            has_index: true,
-            indexed_files: snapshot.files.len(),
-            indexed_at: Some(snapshot.indexed_at),
-            roots: snapshot.roots,
-        })
-    })();
+    let result = rx
+        .recv()
+        .unwrap_or_else(|_| Err("No se pudo recuperar resultado de indexación".to_string()));
 
     state.is_indexing.store(false, Ordering::SeqCst);
     result
+}
+
+fn execute_indexing_worker(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    settings: IndexingSettings,
+    reason: &str,
+) -> Result<IndexStatus, String> {
+    state.cancel_indexing.store(false, Ordering::SeqCst);
+    emit_index_progress(app, "start", "Iniciando indexación...", 0, 0, false);
+
+    let resolved_roots = resolve_roots(Some(settings.roots.clone()));
+    let exclusions = normalize_extensions(Some(settings.excluded_extensions.clone()));
+    let folder_exclusions = normalize_folder_rules(Some(settings.excluded_folders.clone()));
+    let max_file_size_bytes = max_size_bytes(Some(settings.max_file_size_mb));
+
+    let previous_items = state
+        .index
+        .lock()
+        .ok()
+        .and_then(|v| v.as_ref().map(|s| s.files.clone()));
+
+    let build_outcome = build_index_files(
+        app,
+        state,
+        &resolved_roots,
+        &exclusions,
+        &folder_exclusions,
+        max_file_size_bytes,
+        previous_items.as_deref(),
+    );
+
+    let mut diagnostics = IndexDiagnostics {
+        scanned_files: build_outcome.scanned_files,
+        indexed_files: build_outcome.files.len(),
+        pdf_scanned: build_outcome.pdf_scanned,
+        pdf_indexed: build_outcome.pdf_indexed,
+        pdf_failed: build_outcome.pdf_failed,
+        pdf_failed_examples: build_outcome.pdf_failed_examples,
+        last_error: if build_outcome.canceled {
+            Some("Indexación cancelada por el usuario".to_string())
+        } else {
+            None
+        },
+        updated_at: Some(now_timestamp_string()),
+        canceled: build_outcome.canceled,
+        chunk_db_synced: true,
+        pdf_fallback_used: build_outcome.pdf_fallback_used,
+    };
+
+    if let Ok(mut d) = state.diagnostics.lock() {
+        *d = Some(diagnostics.clone());
+    }
+
+    if build_outcome.canceled {
+        return Err("Indexación cancelada por el usuario".to_string());
+    }
+
+    let snapshot = IndexSnapshot {
+        files: build_outcome.files,
+        roots: resolved_roots
+            .iter()
+            .map(|v| v.to_string_lossy().to_string())
+            .collect(),
+        indexed_at: now_timestamp_string(),
+    };
+
+    rebuild_chunk_db(app, &snapshot.files)?;
+    if let Err(err) = rebuild_lancedb_index(app, &snapshot.files, &state.cancel_indexing) {
+        diagnostics.chunk_db_synced = false;
+        diagnostics.last_error = Some(format!("LanceDB no sincronizado: {err}"));
+        if let Ok(mut d) = state.diagnostics.lock() {
+            *d = Some(diagnostics.clone());
+        }
+    }
+
+    save_index_snapshot(app, &snapshot);
+
+    {
+        let mut guard = state
+            .index
+            .lock()
+            .map_err(|_| "No se pudo guardar estado de indexación".to_string())?;
+        *guard = Some(snapshot.clone());
+    }
+
+    if reason.starts_with("watcher") {
+        update_watcher_status(state, |status| {
+            status.last_reindex_at = Some(now_timestamp_string());
+            status.last_error = None;
+        });
+    }
+
+    Ok(IndexStatus {
+        has_index: true,
+        indexed_files: snapshot.files.len(),
+        indexed_at: Some(snapshot.indexed_at),
+        roots: snapshot.roots,
+    })
 }
 
 fn build_index_files(
@@ -991,6 +1067,333 @@ fn build_index_files(
         canceled: false,
         pdf_fallback_used,
     }
+}
+
+#[derive(Clone)]
+struct HybridRankedResult {
+    item: SearchResultItem,
+    score: f32,
+    from_sqlite: bool,
+    from_lancedb: bool,
+}
+
+fn merge_hybrid_results(
+    sqlite_results: Vec<SearchResultItem>,
+    lancedb_results: Vec<SearchResultItem>,
+    max_results: usize,
+) -> Vec<SearchResultItem> {
+    let mut by_path: HashMap<String, HybridRankedResult> = HashMap::new();
+
+    for (index, item) in sqlite_results.into_iter().enumerate() {
+        let base_score = 1.0 - (index as f32 * 0.01);
+        by_path.insert(
+            item.path.clone(),
+            HybridRankedResult {
+                item,
+                score: base_score.max(0.2),
+                from_sqlite: true,
+                from_lancedb: false,
+            },
+        );
+    }
+
+    for (index, item) in lancedb_results.into_iter().enumerate() {
+        let content_score = 1.25 - (index as f32 * 0.01);
+        if let Some(existing) = by_path.get_mut(&item.path) {
+            existing.score += content_score.max(0.2);
+            existing.from_lancedb = true;
+            existing.item.snippet = item.snippet;
+            existing.item.match_reason = item.match_reason;
+        } else {
+            by_path.insert(
+                item.path.clone(),
+                HybridRankedResult {
+                    item,
+                    score: content_score.max(0.2),
+                    from_sqlite: false,
+                    from_lancedb: true,
+                },
+            );
+        }
+    }
+
+    let mut merged = by_path.into_values().collect::<Vec<_>>();
+    merged.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    merged
+        .into_iter()
+        .take(max_results)
+        .map(|mut ranked| {
+            ranked.item.origin = match (ranked.from_sqlite, ranked.from_lancedb) {
+                (true, true) => "hybrid-sqlite-lancedb".to_string(),
+                (true, false) => "sqlite-meta".to_string(),
+                (false, true) => "lancedb-chunk".to_string(),
+                _ => ranked.item.origin,
+            };
+            ranked.item
+        })
+        .collect()
+}
+
+fn search_in_sqlite_metadata(
+    app: &tauri::AppHandle,
+    normalized_query: &str,
+    roots: &[PathBuf],
+    excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
+    max_results: usize,
+) -> Result<Vec<SearchResultItem>, String> {
+    let tokens = tokenize_query(normalized_query);
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = open_semantic_connection(app)?;
+    let clauses: Vec<&str> = tokens.iter().map(|_| "search_key LIKE ?").collect();
+    let mut sql = String::from(
+        "SELECT title, path, search_key, size_bytes, modified_unix_secs FROM files_meta",
+    );
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" OR "));
+    }
+    sql.push_str(" ORDER BY updated_unix_secs DESC LIMIT ?");
+
+    let mut params_vec: Vec<String> = tokens.iter().map(|t| format!("%{}%", t)).collect();
+    params_vec.push((max_results.saturating_mul(8)).max(60).to_string());
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| format!("No se pudo preparar consulta metadata: {err}"))?;
+
+    let rows = stmt
+        .query_map(params_from_iter(params_vec.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|err| format!("No se pudo ejecutar consulta metadata: {err}"))?;
+
+    let mut found = Vec::new();
+    for row in rows.flatten() {
+        let (title, path, search_key, size_raw, _) = row;
+        let size_bytes = size_raw.max(0) as u64;
+        if size_bytes > max_file_size_bytes {
+            continue;
+        }
+
+        let path_buf = PathBuf::from(&path);
+        if !matches_roots(&path_buf, roots)
+            || should_skip_custom_dir(&path_buf, excluded_folders)
+            || is_excluded_file(&path_buf, excluded_extensions)
+        {
+            continue;
+        }
+
+        if !matches_query_strict(&search_key, &tokens, normalized_query) {
+            continue;
+        }
+
+        let score = compute_lexical_score(&search_key, &tokens, normalized_query);
+        found.push((score, title, path));
+    }
+
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Ok(found
+        .into_iter()
+        .take(max_results)
+        .map(|(score, title, path)| SearchResultItem {
+            title,
+            path,
+            snippet: format!("Coincidencia por nombre/ruta (score {:.2})", score),
+            match_reason: format!("Coincidencia rápida por metadatos SQLite (score {:.2}).", score),
+            origin: "sqlite-meta".to_string(),
+        })
+        .collect())
+}
+
+fn search_in_lancedb_chunks(
+    app: &tauri::AppHandle,
+    normalized_query: &str,
+    roots: &[PathBuf],
+    excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
+    max_results: usize,
+) -> Result<Vec<SearchResultItem>, String> {
+    const LANCEDB_SEARCH_TIMEOUT_MS: u64 = 1200;
+
+    let app_handle = app.clone();
+    let query_owned = normalized_query.to_string();
+    let roots_owned = roots.to_vec();
+    let excluded_extensions_owned = excluded_extensions.to_vec();
+    let excluded_folders_owned = excluded_folders.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<SearchResultItem>, String>>();
+
+    std::thread::spawn(move || {
+        let result = tauri::async_runtime::block_on(search_in_lancedb_chunks_async(
+            &app_handle,
+            &query_owned,
+            &roots_owned,
+            &excluded_extensions_owned,
+            &excluded_folders_owned,
+            max_file_size_bytes,
+            max_results,
+        ));
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_millis(LANCEDB_SEARCH_TIMEOUT_MS)) {
+        Ok(value) => value,
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+async fn search_in_lancedb_chunks_async(
+    app: &tauri::AppHandle,
+    normalized_query: &str,
+    roots: &[PathBuf],
+    excluded_extensions: &[String],
+    excluded_folders: &[String],
+    max_file_size_bytes: u64,
+    max_results: usize,
+) -> Result<Vec<SearchResultItem>, String> {
+    let tokens = tokenize_query(normalized_query);
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let db_path = lancedb_dir_path(app).ok_or_else(|| "No se pudo resolver path de LanceDB".to_string())?;
+    let uri = db_path.to_string_lossy().to_string();
+    let db = connect(&uri)
+        .execute()
+        .await
+        .map_err(|err| format!("No se pudo conectar LanceDB: {err}"))?;
+
+    let table = match db.open_table("chunks").execute().await {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let where_clause = tokens
+        .iter()
+        .map(|token| format!("search_key LIKE '%{}%'", token.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let mut query_builder = table.query().limit(max_results.saturating_mul(12).max(80));
+    if !where_clause.is_empty() {
+        query_builder = query_builder.only_if(where_clause);
+    }
+
+    let mut stream = query_builder
+        .execute()
+        .await
+        .map_err(|err| format!("No se pudo ejecutar query LanceDB: {err}"))?;
+
+    let mut best_by_path = HashMap::<String, (String, String, f32)>::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|err| format!("No se pudo leer stream LanceDB: {err}"))?
+    {
+        let title_col = match batch
+            .column_by_name("title")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let path_col = match batch
+            .column_by_name("path")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let chunk_text_col = match batch
+            .column_by_name("chunk_text")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let search_key_col = match batch
+            .column_by_name("search_key")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let size_col = match batch
+            .column_by_name("size_bytes")
+            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+
+        for row in 0..batch.num_rows() {
+            if title_col.is_null(row)
+                || path_col.is_null(row)
+                || chunk_text_col.is_null(row)
+                || search_key_col.is_null(row)
+                || size_col.is_null(row)
+            {
+                continue;
+            }
+
+            let title = title_col.value(row).to_string();
+            let path = path_col.value(row).to_string();
+            let chunk_text = chunk_text_col.value(row).to_string();
+            let search_key = search_key_col.value(row).to_string();
+            let size_bytes = size_col.value(row).max(0) as u64;
+            if size_bytes > max_file_size_bytes {
+                continue;
+            }
+
+            let path_buf = PathBuf::from(&path);
+            if !matches_roots(&path_buf, roots)
+                || should_skip_custom_dir(&path_buf, excluded_folders)
+                || is_excluded_file(&path_buf, excluded_extensions)
+            {
+                continue;
+            }
+
+            if !matches_query_strict(&search_key, &tokens, normalized_query) {
+                continue;
+            }
+
+            let score = compute_lexical_score(&search_key, &tokens, normalized_query);
+            let current = best_by_path.get(&path).map(|v| v.2).unwrap_or(-1.0);
+            if score > current {
+                best_by_path.insert(path, (title, chunk_text, score));
+            }
+        }
+    }
+
+    let mut values = best_by_path
+        .into_iter()
+        .map(|(path, (title, chunk_text, score))| (title, path, chunk_text, score))
+        .collect::<Vec<_>>();
+    values.sort_by(|a, b| b.3.total_cmp(&a.3));
+
+    Ok(values
+        .into_iter()
+        .take(max_results)
+        .map(|(title, path, chunk_text, score)| SearchResultItem {
+            title,
+            path,
+            snippet: build_chunk_snippet(&chunk_text, normalized_query),
+            match_reason: format!("Coincidencia de contenido en LanceDB (score {:.2}).", score),
+            origin: "lancedb-chunk".to_string(),
+        })
+        .collect())
 }
 
 fn search_in_index(
@@ -1292,10 +1695,26 @@ fn rebuild_chunk_db(app: &tauri::AppHandle, items: &[IndexedFileItem]) -> Result
 
     tx.execute("DELETE FROM chunks", [])
         .map_err(|err| format!("No se pudo limpiar chunks: {err}"))?;
+    tx.execute("DELETE FROM files_meta", [])
+        .map_err(|err| format!("No se pudo limpiar metadata: {err}"))?;
 
     let now_unix = now_timestamp_string().parse::<u64>().unwrap_or_default() as i64;
 
     for item in items {
+        tx.execute(
+            "INSERT OR REPLACE INTO files_meta (path, title, search_key, size_bytes, modified_unix_secs, updated_unix_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                item.path,
+                item.title,
+                normalize_for_search_text(&format!("{} {}", item.title, item.path)),
+                item.size_bytes as i64,
+                item.modified_unix_secs as i64,
+                now_unix,
+            ],
+        )
+        .map_err(|err| format!("No se pudo insertar metadata: {err}"))?;
+
         let base = item
             .content_excerpt
             .as_ref()
@@ -1339,7 +1758,18 @@ fn open_semantic_connection(app: &tauri::AppHandle) -> Result<Connection, String
 
 fn ensure_semantic_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS chunks (
+        "CREATE TABLE IF NOT EXISTS files_meta (
+            path TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            search_key TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            modified_unix_secs INTEGER NOT NULL,
+            updated_unix_secs INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_files_meta_search_key ON files_meta(search_key);
+        CREATE INDEX IF NOT EXISTS idx_files_meta_title ON files_meta(title);
+
+        CREATE TABLE IF NOT EXISTS chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL,
             title TEXT NOT NULL,
@@ -2381,9 +2811,37 @@ fn matches_roots(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 fn should_skip_dir(path: &Path) -> bool {
+    let lowered = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|v| v.to_lowercase())
+        .unwrap_or_default();
+
     matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("node_modules") | Some("target") | Some(".git")
+        lowered.as_str(),
+        "node_modules"
+            | "target"
+            | ".git"
+            | ".idea"
+            | ".vscode"
+            | ".next"
+            | ".nuxt"
+            | "dist"
+            | "build"
+            | "out"
+            | "coverage"
+            | "vendor"
+            | "tmp"
+            | "temp"
+            | "cache"
+            | ".cache"
+            | "appdata"
+            | "$recycle.bin"
+            | "system volume information"
+            | "windows"
+            | "program files"
+            | "program files (x86)"
+            | "programdata"
     )
 }
 
@@ -2487,6 +2945,205 @@ fn semantic_db_path(app: &tauri::AppHandle) -> Option<PathBuf> {
         let _ = fs::create_dir_all(parent);
     }
     Some(path)
+}
+
+fn lancedb_dir_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("lancedb");
+    let _ = fs::create_dir_all(&path);
+    Some(path)
+}
+
+#[derive(Default)]
+struct LanceChunkBatch {
+    title: Vec<String>,
+    path: Vec<String>,
+    chunk_text: Vec<String>,
+    search_key: Vec<String>,
+    size_bytes: Vec<i64>,
+    modified_unix_secs: Vec<i64>,
+    updated_unix_secs: Vec<i64>,
+    chunk_index: Vec<i64>,
+}
+
+impl LanceChunkBatch {
+    fn len(&self) -> usize {
+        self.path.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.path.is_empty()
+    }
+
+    fn push(
+        &mut self,
+        title: String,
+        path: String,
+        chunk_text: String,
+        search_key: String,
+        size_bytes: i64,
+        modified_unix_secs: i64,
+        updated_unix_secs: i64,
+        chunk_index: i64,
+    ) {
+        self.title.push(title);
+        self.path.push(path);
+        self.chunk_text.push(chunk_text);
+        self.search_key.push(search_key);
+        self.size_bytes.push(size_bytes);
+        self.modified_unix_secs.push(modified_unix_secs);
+        self.updated_unix_secs.push(updated_unix_secs);
+        self.chunk_index.push(chunk_index);
+    }
+
+    fn drain_into_record_batch(&mut self, schema: Arc<Schema>) -> Result<RecordBatch, String> {
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(std::mem::take(&mut self.title))),
+                Arc::new(StringArray::from(std::mem::take(&mut self.path))),
+                Arc::new(StringArray::from(std::mem::take(&mut self.chunk_text))),
+                Arc::new(StringArray::from(std::mem::take(&mut self.search_key))),
+                Arc::new(Int64Array::from(std::mem::take(&mut self.size_bytes))),
+                Arc::new(Int64Array::from(std::mem::take(&mut self.modified_unix_secs))),
+                Arc::new(Int64Array::from(std::mem::take(&mut self.updated_unix_secs))),
+                Arc::new(Int64Array::from(std::mem::take(&mut self.chunk_index))),
+            ],
+        )
+        .map_err(|err| format!("No se pudo crear batch Arrow para LanceDB: {err}"))?;
+        Ok(batch)
+    }
+}
+
+fn lancedb_chunks_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("title", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("chunk_text", DataType::Utf8, false),
+        Field::new("search_key", DataType::Utf8, false),
+        Field::new("size_bytes", DataType::Int64, false),
+        Field::new("modified_unix_secs", DataType::Int64, false),
+        Field::new("updated_unix_secs", DataType::Int64, false),
+        Field::new("chunk_index", DataType::Int64, false),
+    ]))
+}
+
+async fn flush_lancedb_batch(
+    db: &lancedb::connection::Connection,
+    table: &mut Option<LanceTable>,
+    schema: Arc<Schema>,
+    pending: &mut LanceChunkBatch,
+) -> Result<(), String> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let batch = pending.drain_into_record_batch(schema.clone())?;
+    let data = Box::new(RecordBatchIterator::new(
+        vec![batch].into_iter().map(Ok),
+        schema,
+    ));
+
+    if let Some(existing) = table.as_ref() {
+        existing
+            .add(data)
+            .execute()
+            .await
+            .map_err(|err| format!("No se pudo agregar batch a LanceDB: {err}"))?;
+        return Ok(());
+    }
+
+    let created = db
+        .create_table("chunks", data)
+        .execute()
+        .await
+        .map_err(|err| format!("No se pudo crear tabla LanceDB chunks: {err}"))?;
+    *table = Some(created);
+    Ok(())
+}
+
+async fn rebuild_lancedb_index_async(
+    app: &tauri::AppHandle,
+    items: &[IndexedFileItem],
+    cancel_flag: &AtomicBool,
+) -> Result<(), String> {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err("Indexación cancelada por el usuario".to_string());
+    }
+
+    let db_dir = lancedb_dir_path(app).ok_or_else(|| "No se pudo resolver ruta de LanceDB".to_string())?;
+    fs::create_dir_all(&db_dir)
+        .map_err(|err| format!("No se pudo preparar directorio de LanceDB: {err}"))?;
+
+    let uri = db_dir.to_string_lossy().to_string();
+    let db = connect(&uri)
+        .execute()
+        .await
+        .map_err(|err| format!("No se pudo conectar LanceDB: {err}"))?;
+
+    let _ = db.drop_table("chunks").await;
+
+    let schema = lancedb_chunks_schema();
+    let mut table: Option<LanceTable> = None;
+    let mut pending = LanceChunkBatch::default();
+    let now_unix = now_timestamp_string().parse::<u64>().unwrap_or_default() as i64;
+
+    for item in items {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err("Indexación cancelada por el usuario".to_string());
+        }
+
+        let base = item
+            .content_excerpt
+            .as_ref()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| item.title.clone());
+
+        let mut chunks = split_text_chunks(&base, 900, 180);
+        if chunks.is_empty() {
+            chunks.push(item.title.clone());
+        }
+
+        for (chunk_index, chunk_text) in chunks.into_iter().enumerate() {
+            let search_key = normalize_for_search_text(&format!(
+                "{} {} {}",
+                item.title, item.path, chunk_text
+            ));
+
+            pending.push(
+                item.title.clone(),
+                item.path.clone(),
+                chunk_text,
+                search_key,
+                item.size_bytes as i64,
+                item.modified_unix_secs as i64,
+                now_unix,
+                chunk_index as i64,
+            );
+
+            if pending.len() >= LANCEDB_BATCH_WRITE_SIZE {
+                flush_lancedb_batch(&db, &mut table, schema.clone(), &mut pending).await?;
+            }
+        }
+    }
+
+    flush_lancedb_batch(&db, &mut table, schema.clone(), &mut pending).await?;
+
+    if table.is_none() {
+        db.create_empty_table("chunks", schema)
+            .execute()
+            .await
+            .map_err(|err| format!("No se pudo crear tabla LanceDB vacía: {err}"))?;
+    }
+
+    Ok(())
+}
+
+fn rebuild_lancedb_index(
+    app: &tauri::AppHandle,
+    items: &[IndexedFileItem],
+    cancel_flag: &AtomicBool,
+) -> Result<(), String> {
+    tauri::async_runtime::block_on(rebuild_lancedb_index_async(app, items, cancel_flag))
 }
 
 fn save_index_snapshot(app: &tauri::AppHandle, snapshot: &IndexSnapshot) {

@@ -29,4 +29,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 notify = "6"
 lopdf = "0.35"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+lancedb = "0.10"
+arrow-array = "52"
+arrow-schema = "52"
+futures = "0.3"
+rayon = "1.10"
 
