@@ -9,5 +9,5 @@ Está enfocada en:
 - indexación de texto y documentos.
 
 ## Mejoras futuras
-- Integrar IA a modo de chatbot, para preguntas no tan exactas
-- Integrar reconcimiento de Imagen
+- Integrar IA a modo de chatbot.
+- Integrar reconocimiento de Imagen.
