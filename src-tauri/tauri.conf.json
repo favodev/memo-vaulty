@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "memo-vaulty",
+  "productName": "MemoVault",
   "version": "0.1.0",
   "identifier": "com.favodev.memo-vaulty",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "memo-vaulty",
+        "title": "MemoVault",
         "decorations": true,
         "width": 800,
         "height": 600

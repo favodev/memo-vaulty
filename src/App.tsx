@@ -286,10 +286,6 @@ function App() {
     setSearchRoots(unique);
   };
 
-  const removeRoot = (root: string) => {
-    setSearchRoots((prev) => prev.filter((item) => item !== root));
-  };
-
   const removeRootPersisted = async (root: string) => {
     try {
       const status = await invoke<IndexStatus>("forget_index_root", { root, reindex: true });
@@ -487,11 +483,9 @@ function App() {
           transition={{ duration: 0.25, ease: "easeOut" }}
           className="rounded-3xl border border-zinc-800/80 bg-linear-to-b from-black via-zinc-950/80 to-black p-4 shadow-2xl shadow-black/40 backdrop-blur"
         >
-          <div className="mb-4 flex items-center justify-between">
+          <div className="mb-4 flex items-center gap-2">
+            <img src="/logo.png" alt="MemoVault logo" className="h-8 w-8 rounded-lg border border-zinc-700/80" />
             <h1 className="text-lg font-semibold tracking-tight">MemoVault</h1>
-            <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-xs text-emerald-300">
-              Texto
-            </span>
           </div>
 
           <div className="space-y-3">
@@ -558,21 +552,14 @@ function App() {
                         <p className="truncate text-[11px] font-medium text-zinc-300" title={getPathTail(root)}>{getPathTail(root)}</p>
                         <p className="truncate text-[10px] text-zinc-500" title={root}>{root}</p>
                       </div>
-                    </div>
-                    <div className="mt-2 flex gap-2">
-                      <button
-                        type="button"
-                        onClick={() => removeRoot(root)}
-                        className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-zinc-500"
-                      >
-                        Quitar
-                      </button>
                       <button
                         type="button"
                         onClick={() => void removeRootPersisted(root)}
-                        className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-zinc-500"
+                        title="Quitar carpeta"
+                        aria-label={`Quitar ${root}`}
+                        className="ml-1 grid h-6 w-6 shrink-0 place-items-center rounded-md border border-rose-500/40 text-rose-300 transition hover:border-rose-400 hover:bg-rose-500/10"
                       >
-                        Olvidar
+                        x
                       </button>
                     </div>
                   </motion.div>
@@ -640,15 +627,6 @@ function App() {
               placeholder="Buscar en texto, markdown, código, PDFs, DOCX, ODT, RTF..."
               className="h-12 w-full rounded-2xl border border-zinc-800 bg-black/80 px-4 text-sm outline-none transition focus:border-emerald-400"
             />
-            <motion.button
-              type="button"
-              onClick={runSearch}
-              disabled={isLoading}
-              whileTap={{ scale: 0.98 }}
-              className="h-12 rounded-2xl bg-zinc-100 px-5 text-sm font-semibold text-zinc-900 transition hover:bg-white disabled:opacity-60"
-            >
-              {isLoading ? "Buscando..." : "Buscar"}
-            </motion.button>
           </div>
 
           <div className="mb-4 flex items-center gap-2 px-1 text-[11px] text-zinc-500">
